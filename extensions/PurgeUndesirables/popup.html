@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PurgeUndesirables</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="header">
+        <div>
+          <p class="eyebrow">HISTORY FILTER</p>
+          <h1>PurgeUndesirables</h1>
+        </div>
+        <div class="mark" aria-hidden="true">PU</div>
+      </header>
+
+      <form id="add-form" class="card add-form">
+        <label class="field-label" for="domain-input">Domain</label>
+        <div class="input-row">
+          <input
+            id="domain-input"
+            name="domain"
+            type="text"
+            inputmode="url"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="facebook.com"
+            required
+          />
+          <button class="primary" type="submit">Add</button>
+        </div>
+
+        <label class="check-row">
+          <input id="purge-existing" type="checkbox" checked />
+          <span>Purge existing history now</span>
+        </label>
+
+        <label class="check-row">
+          <input id="purge-future" type="checkbox" checked />
+          <span>Auto-purge future visits</span>
+        </label>
+      </form>
+
+      <section class="domains-section" aria-labelledby="domains-title">
+        <div class="section-heading">
+          <h2 id="domains-title">Domains</h2>
+          <span id="domain-count" class="count">0</span>
+        </div>
+        <div id="empty-state" class="empty-state">
+          No domains yet. Add one above.
+        </div>
+        <div id="domain-list" class="domain-list"></div>
+      </section>
+
+      <p id="status" class="status" role="status" aria-live="polite"></p>
+
+      <footer class="footer">
+        Only matching history URLs are removed. Cookies, passwords, cache and bookmarks are untouched.
+      </footer>
+    </main>
+
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

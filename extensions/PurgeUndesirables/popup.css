@@ -1,0 +1,303 @@
+:root {
+  color-scheme: dark;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: #0f1012;
+  color: #f5f5f5;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 380px;
+  background: #0f1012;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+.shell {
+  padding: 18px;
+}
+
+.header,
+.section-heading,
+.input-row,
+.domain-main,
+.domain-actions {
+  display: flex;
+  align-items: center;
+}
+
+.header {
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.eyebrow {
+  margin: 0 0 2px;
+  color: #8b8e94;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+}
+
+h1,
+h2,
+p {
+  margin-top: 0;
+}
+
+h1 {
+  margin-bottom: 0;
+  font-size: 20px;
+  line-height: 1.2;
+}
+
+h2 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.mark {
+  display: grid;
+  width: 36px;
+  height: 36px;
+  place-items: center;
+  border: 1px solid #373a40;
+  border-radius: 10px;
+  background: #191b1f;
+  color: #b9bcc2;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+}
+
+.card {
+  border: 1px solid #2a2d32;
+  border-radius: 12px;
+  background: #16181b;
+}
+
+.add-form {
+  padding: 14px;
+}
+
+.field-label {
+  display: block;
+  margin-bottom: 7px;
+  color: #b4b7bd;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.input-row {
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+input[type="text"] {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid #35383e;
+  border-radius: 9px;
+  outline: none;
+  background: #101114;
+  color: #f4f4f5;
+  padding: 9px 10px;
+}
+
+input[type="text"]:focus {
+  border-color: #696e77;
+}
+
+.primary,
+.secondary,
+.icon-button {
+  border: 1px solid #3b3e45;
+  border-radius: 9px;
+  background: #23262b;
+  color: #f7f7f7;
+}
+
+.primary {
+  padding: 9px 13px;
+  font-weight: 700;
+}
+
+.primary:hover,
+.secondary:hover,
+.icon-button:hover {
+  background: #2d3036;
+}
+
+.primary:disabled,
+.secondary:disabled,
+.icon-button:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.check-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  color: #c4c6ca;
+  font-size: 12px;
+}
+
+.check-row input {
+  accent-color: #d7d7d7;
+}
+
+.domains-section {
+  margin-top: 18px;
+}
+
+.section-heading {
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.count {
+  display: inline-grid;
+  min-width: 23px;
+  height: 20px;
+  place-items: center;
+  border-radius: 999px;
+  background: #202227;
+  color: #aeb1b7;
+  font-size: 11px;
+}
+
+.empty-state {
+  padding: 16px 4px;
+  color: #777b83;
+  font-size: 12px;
+}
+
+.domain-list {
+  display: grid;
+  gap: 8px;
+}
+
+.domain-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 11px;
+  border: 1px solid #292c31;
+  border-radius: 10px;
+  background: #15171a;
+}
+
+.domain-main {
+  min-width: 0;
+  gap: 9px;
+}
+
+.domain-name {
+  overflow: hidden;
+  font-size: 12px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.auto-label {
+  color: #8d9198;
+  font-size: 10px;
+}
+
+.domain-actions {
+  flex: 0 0 auto;
+  gap: 6px;
+}
+
+.secondary,
+.icon-button {
+  padding: 6px 8px;
+  font-size: 11px;
+}
+
+.icon-button {
+  width: 29px;
+  padding-inline: 0;
+  color: #c8cacf;
+}
+
+.toggle {
+  position: relative;
+  width: 30px;
+  height: 18px;
+  flex: 0 0 auto;
+}
+
+.toggle input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.toggle-track {
+  position: absolute;
+  inset: 0;
+  border: 1px solid #3b3e44;
+  border-radius: 999px;
+  background: #202227;
+  transition: 120ms ease;
+}
+
+.toggle-track::after {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #8e9299;
+  content: "";
+  transition: 120ms ease;
+}
+
+.toggle input:checked + .toggle-track {
+  background: #e2e2e2;
+  border-color: #e2e2e2;
+}
+
+.toggle input:checked + .toggle-track::after {
+  transform: translateX(12px);
+  background: #121316;
+}
+
+.status {
+  min-height: 18px;
+  margin: 12px 0 0;
+  color: #aeb1b7;
+  font-size: 11px;
+}
+
+.status.error {
+  color: #ef9a9a;
+}
+
+.footer {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid #24272b;
+  color: #70747b;
+  font-size: 10px;
+  line-height: 1.45;
+}
