@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Hero Bookmarks",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "minimum_chrome_version": "134",
   "description": "Find, open and organize your Chrome bookmarks in a floating launcher with folders, drag and drop, and light and dark themes.",
   "permissions": ["bookmarks", "scripting", "activeTab", "favicon", "storage"],
