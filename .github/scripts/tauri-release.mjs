@@ -70,41 +70,31 @@ if (selected.length === 0) {
 await mkdir(outputDir, { recursive: true });
 
 const latestJsonPath = path.join(outputDir, 'latest.json');
-const latestJson = {
-  version,
-  notes: releaseNotes,
-  pub_date: pubDate,
-  platforms: Object.fromEntries(
-    await Promise.all(
-      selected.map(async (candidate) => [
-        candidate.platform,
-        {
-          signature: await readSignature(candidate.signaturePath),
-          url: releaseAssetUrl(repository, tagName, candidate.uploadName),
-        },
-      ]),
-    ),
+const artifactAssets = uniqueByPath(
+  candidates.flatMap((candidate) => [candidate.assetPath, candidate.signaturePath]),
+);
+const uploadAssets = [...artifactAssets, latestJsonPath];
+const uploadNames = new Map();
+for (const assetPath of uploadAssets) {
+  const name = releaseAssetName(assetPath);
+  if (uploadNames.has(name)) {
+    fail(`Release asset name collision: ${uploadNames.get(name)} and ${assetPath} both use ${name}.`);
+  }
+  uploadNames.set(name, assetPath);
+}
+
+// Read signatures before changing a release. Preview mode can only predict
+// URLs; a real publication must use the metadata returned by GitHub.
+const signatures = new Map(
+  await Promise.all(
+    selected.map(async (candidate) => [candidate.platform, await readSignature(candidate.signaturePath)]),
   ),
-};
-
-await writeFile(latestJsonPath, `${JSON.stringify(latestJson, null, 2)}\n`, 'utf8');
-
-const uploadAssets = uniqueByPath([
-  ...candidates.flatMap((candidate) => [candidate.assetPath, candidate.signaturePath]),
-  latestJsonPath,
-]);
-
-printSummary({
-  artifactDir,
-  latestJsonPath,
-  repository,
-  tagName,
-  version,
-  selected,
-  uploadAssets,
-});
+);
 
 if (dryRun || skipUpload) {
+  await writeLatestJson();
+  printSummary({ artifactDir, latestJsonPath, repository, tagName, version, selected, uploadAssets });
+  console.log('Preview URLs use the requested upload names; no GitHub upload URLs were resolved.');
   console.log(dryRun ? 'Dry run enabled; no assets were uploaded.' : 'Upload skipped.');
   process.exit(0);
 }
@@ -123,17 +113,47 @@ const release = await getOrCreateRelease({
   prerelease,
 });
 
-for (const assetPath of uploadAssets) {
-  await uploadReleaseAsset({
+const uploadedAssets = new Map();
+for (const assetPath of artifactAssets) {
+  const uploaded = await uploadReleaseAsset({
     repository,
     token,
     release,
     assetPath,
-    assetName: path.basename(assetPath),
+    assetName: releaseAssetName(assetPath),
   });
+  uploadedAssets.set(path.resolve(assetPath), uploaded);
 }
 
+// Publish the manifest last, only after every installer and signature exists.
+await writeLatestJson(uploadedAssets);
+await uploadReleaseAsset({
+  repository,
+  token,
+  release,
+  assetPath: latestJsonPath,
+  assetName: 'latest.json',
+});
+
+printSummary({ artifactDir, latestJsonPath, repository, tagName, version, selected, uploadAssets });
 console.log(`Release ${tagName} is ready: https://github.com/${repository}/releases/tag/${tagName}`);
+
+async function writeLatestJson(uploadedAssets) {
+  const platforms = Object.fromEntries(selected.map((candidate) => {
+    const uploaded = uploadedAssets?.get(path.resolve(candidate.assetPath));
+    if (uploadedAssets && !uploaded?.browser_download_url) {
+      fail(`GitHub did not return a download URL for ${candidate.uploadName}; latest.json was not published.`);
+    }
+    return [candidate.platform, {
+      signature: signatures.get(candidate.platform),
+      url: uploadedAssets
+        ? uploaded.browser_download_url
+        : releaseAssetUrl(repository, tagName, candidate.uploadName),
+    }];
+  }));
+  const latestJson = { version, notes: releaseNotes, pub_date: pubDate, platforms };
+  await writeFile(latestJsonPath, `${JSON.stringify(latestJson, null, 2)}\n`, 'utf8');
+}
 
 async function findUpdaterCandidates(directory) {
   const signatures = await findFiles(directory, (filePath) => filePath.endsWith('.sig'));
@@ -158,7 +178,7 @@ async function findUpdaterCandidates(directory) {
       assetPath,
       signaturePath,
       platform,
-      uploadName: path.basename(assetPath),
+      uploadName: releaseAssetName(assetPath),
       priority: platformPriority(assetPath),
     });
   }
@@ -353,6 +373,12 @@ async function uploadReleaseAsset({ repository, token, release, assetPath, asset
     const text = await response.text();
     fail(`GitHub upload failed for ${assetName}: ${response.status} ${text}`);
   }
+
+  const uploaded = await response.json();
+  if (uploaded.state !== 'uploaded' || uploaded.size !== fileInfo.size || !uploaded.browser_download_url) {
+    fail(`GitHub did not confirm a complete upload for ${assetName}; latest.json was not published.`);
+  }
+  return uploaded;
 }
 
 async function findReleaseAsset({ repository, token, release, assetName }) {
@@ -401,6 +427,12 @@ async function githubRequest({ token, method, pathName, body, allowNotFound = fa
 
 function releaseAssetUrl(repository, tagName, assetName) {
   return `https://github.com/${repository}/releases/download/${encodeURIComponent(tagName)}/${encodeURIComponent(assetName)}`;
+}
+
+function releaseAssetName(filePath) {
+  // Request stable, URL-safe names so a retry also finds previously uploaded
+  // assets instead of looking for a local filename which GitHub renamed.
+  return path.basename(filePath).replace(/[^A-Za-z0-9._-]/g, '.');
 }
 
 async function readJson(filePath) {

@@ -103,8 +103,11 @@ To publish signed updates:
    `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
 3. Run the **Release Tauri app** workflow from GitHub Actions.
 
-The workflow builds signed Tauri updater artifacts, creates `latest.json`, and
-uploads the installer, signatures and update manifest to the GitHub Release.
+The workflow builds signed Tauri updater artifacts, uploads the installers and
+signatures with stable asset names, and generates `latest.json` using the actual
+`browser_download_url` returned by GitHub. The update manifest is uploaded last,
+after all artifact uploads have been confirmed. Dry-run and skip-upload modes
+generate preview URLs only; they do not resolve published GitHub download URLs.
 Authenticode signing is intentionally outside the pilot MVP.
 
 ## Verification scope
