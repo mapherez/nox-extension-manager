@@ -213,36 +213,77 @@ impl WindowsChromeAutomation {
         }
 
         let expected = chrome_extension_id.to_string();
-        let labels = automation.create_matcher().from(window.clone())
+        let labels = automation
+            .create_matcher()
+            .from(window.clone())
             .filter_fn(Box::new(move |element: &UIElement| {
-                Ok(element.get_name().ok().and_then(|name| extract_chrome_extension_id(&name)).as_deref() == Some(&expected))
+                Ok(element
+                    .get_name()
+                    .ok()
+                    .and_then(|name| extract_chrome_extension_id(&name))
+                    .as_deref()
+                    == Some(&expected))
             }))
-            .depth(30).timeout(5_000).find_all()
-            .map_err(|_| format!("Chrome did not expose ID {chrome_extension_id}; action blocked"))?;
+            .depth(30)
+            .timeout(5_000)
+            .find_all()
+            .map_err(|_| {
+                format!("Chrome did not expose ID {chrome_extension_id}; action blocked")
+            })?;
         let mut current = exactly_one(labels, "extension ID label")?;
-        let walker = automation.get_control_view_walker().map_err(|error| error.to_string())?;
+        let walker = automation
+            .get_control_view_walker()
+            .map_err(|error| error.to_string())?;
         for _ in 0..10 {
-            let labels = automation.create_matcher().from(current.clone())
+            let labels = automation
+                .create_matcher()
+                .from(current.clone())
                 .filter_fn(Box::new(|element: &UIElement| {
-                    Ok(element.get_name().ok().and_then(|name| extract_chrome_extension_id(&name)).is_some())
+                    Ok(element
+                        .get_name()
+                        .ok()
+                        .and_then(|name| extract_chrome_extension_id(&name))
+                        .is_some())
                 }))
-                .depth(30).timeout(0).find_all().map_err(|error| error.to_string())?;
-            let ids: BTreeSet<_> = labels.into_iter().filter_map(|element| {
-                element.get_name().ok().and_then(|name| extract_chrome_extension_id(&name))
-            }).collect();
-            let remove_count = automation.create_matcher().from(current.clone())
+                .depth(30)
+                .timeout(0)
+                .find_all()
+                .map_err(|error| error.to_string())?;
+            let ids: BTreeSet<_> = labels
+                .into_iter()
+                .filter_map(|element| {
+                    element
+                        .get_name()
+                        .ok()
+                        .and_then(|name| extract_chrome_extension_id(&name))
+                })
+                .collect();
+            let remove_count = automation
+                .create_matcher()
+                .from(current.clone())
                 .control_type(ControlType::Button)
-                .filter_fn(Box::new(|element: &UIElement| Ok(element.get_automation_id()? == REMOVE_BUTTON_ID)))
-                .depth(30).timeout(0).find_all().ok().map(|buttons| buttons.len()).unwrap_or(0);
+                .filter_fn(Box::new(|element: &UIElement| {
+                    Ok(element.get_automation_id()? == REMOVE_BUTTON_ID)
+                }))
+                .depth(30)
+                .timeout(0)
+                .find_all()
+                .ok()
+                .map(|buttons| buttons.len())
+                .unwrap_or(0);
             if card_scope_is_unique(chrome_extension_id, &ids, remove_count) {
                 return Ok(current);
             }
             if ids.len() > 1 || remove_count > 1 {
                 break;
             }
-            current = walker.get_parent(&current).map_err(|error| error.to_string())?;
+            current = walker
+                .get_parent(&current)
+                .map_err(|error| error.to_string())?;
         }
-        Err(format!("Chrome did not expose an isolated card for {chrome_extension_id}; action blocked"))
+        Err(format!(
+            "Chrome did not expose an isolated card for {chrome_extension_id}; action blocked"
+        ))
     }
 
     fn find_extension_button(
@@ -486,8 +527,10 @@ fn card_scope_is_unique(expected: &str, ids: &BTreeSet<String>, remove_count: us
 }
 
 fn extract_chrome_extension_id(value: &str) -> Option<String> {
-    value.split(|character| !('a'..='p').contains(&character))
-        .find(|candidate| candidate.len() == 32).map(str::to_owned)
+    value
+        .split(|character| !('a'..='p').contains(&character))
+        .find(|candidate| candidate.len() == 32)
+        .map(str::to_owned)
 }
 
 fn invoke(element: &UIElement, label: &str) -> Result<(), String> {
@@ -512,10 +555,26 @@ mod tests {
     fn shared_ancestors_and_neighboring_controls_are_never_extension_cards() {
         let expected = "abcdefghijklmnopabcdefghijklmnop";
         let other = "ponmlkjihgfedcbaponmlkjihgfedcba";
-        assert!(card_scope_is_unique(expected, &BTreeSet::from([expected.into()]), 1));
-        assert!(!card_scope_is_unique(expected, &BTreeSet::from([expected.into(), other.into()]), 1));
-        assert!(!card_scope_is_unique(expected, &BTreeSet::from([expected.into()]), 2));
-        assert!(!card_scope_is_unique(expected, &BTreeSet::from([other.into()]), 1));
+        assert!(card_scope_is_unique(
+            expected,
+            &BTreeSet::from([expected.into()]),
+            1
+        ));
+        assert!(!card_scope_is_unique(
+            expected,
+            &BTreeSet::from([expected.into(), other.into()]),
+            1
+        ));
+        assert!(!card_scope_is_unique(
+            expected,
+            &BTreeSet::from([expected.into()]),
+            2
+        ));
+        assert!(!card_scope_is_unique(
+            expected,
+            &BTreeSet::from([other.into()]),
+            1
+        ));
         assert!(!card_scope_is_unique(expected, &BTreeSet::new(), 1));
     }
 }
