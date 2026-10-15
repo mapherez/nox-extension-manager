@@ -64,7 +64,7 @@ describe('extension cards', () => {
 
   it('repairs the selected extension when local files were modified', () => {
     const { onAction, onRemove } = renderCard('locallyModified');
-    fireEvent.click(screen.getByRole('button', { name: 'Restore and repair Test Extension' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Restore repository files for Test Extension' }));
     expect(onAction).toHaveBeenCalledWith('repair', 'test-extension');
     expect(onRemove).not.toHaveBeenCalled();
   });

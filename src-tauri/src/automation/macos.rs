@@ -196,6 +196,16 @@ impl MacOsChromeAutomation {
 }
 
 impl BrowserAutomationBackend for MacOsChromeAutomation {
+    fn registered_id(&self, extension_path: &Path) -> Result<Option<String>, String> {
+        let profile = dirs::home_dir()
+            .ok_or("The home directory could not be resolved")?
+            .join("Library/Application Support/Google/Chrome/Default");
+        if !profile.is_dir() {
+            return Ok(None);
+        }
+        registration::registered_id(&profile, extension_path)
+    }
+
     fn preflight(&self) -> Result<(), String> {
         self.chrome_app_path()?;
         if application_is_trusted_with_prompt() {

@@ -15,7 +15,6 @@ const LOAD_UNPACKED_ID: &str = "loadUnpacked";
 const FOLDER_PICKER_ADDRESS_BAR_ID: &str = "41477";
 const FOLDER_PICKER_CONFIRM_ID: &str = "1";
 const REMOVE_BUTTON_ID: &str = "removeButton";
-const RELOAD_BUTTON_IDS: &[&str] = &["dev-reload-button", "terminated-reload-button"];
 const REMOVE_NAMES: &[&str] = &["Remove", "Remover"];
 
 pub struct WindowsChromeAutomation;
@@ -121,14 +120,17 @@ impl WindowsChromeAutomation {
 
     fn choose_extension_folder(
         automation: &UIAutomation,
+        window: &UIElement,
         extension_path: &Path,
     ) -> Result<(), String> {
+        let process_id = window.get_process_id().map_err(|error| error.to_string())?;
         let dialog = automation
             .create_matcher()
             .control_type(ControlType::Window)
-            .filter_fn(Box::new(|element: &UIElement| {
+            .filter_fn(Box::new(move |element: &UIElement| {
                 let class = element.get_classname()?;
-                Ok(class == "#32770" || class == "DirectUIHWND")
+                Ok(element.get_process_id()? == process_id
+                    && (class == "#32770" || class == "DirectUIHWND"))
             }))
             .depth(4)
             .timeout(8_000)
@@ -148,7 +150,10 @@ impl WindowsChromeAutomation {
         let edit = automation
             .get_focused_element()
             .ok()
-            .filter(|element| element.get_control_type().ok() == Some(ControlType::Edit))
+            .filter(|element| {
+                element.get_control_type().ok() == Some(ControlType::Edit)
+                    && element.get_process_id().ok() == Some(process_id)
+            })
             .or_else(|| {
                 automation
                     .create_matcher()
@@ -187,6 +192,57 @@ impl WindowsChromeAutomation {
                 "The folder picker's confirm button was not exposed by Windows".to_string()
             })?;
         invoke(&confirm, "Select Folder")
+    }
+
+    fn load_folder(
+        &self,
+        extension_path: &Path,
+        expected_version: &str,
+        expected_id: Option<&str>,
+    ) -> Result<String, String> {
+        self.preflight()?;
+        verify_local_version(extension_path, expected_version)?;
+        self.with_extensions_page(|automation, window| {
+            let profile = Self::profile_directory()?;
+            let before = registration::load_stamp(&profile, extension_path)?;
+            let buttons = automation.create_matcher().from(window.clone())
+                .control_type(ControlType::Button)
+                .filter_fn(Box::new(|element: &UIElement| {
+                    let id = element.get_automation_id().unwrap_or_default();
+                    let name = element.get_name().unwrap_or_default();
+                    Ok(id == LOAD_UNPACKED_ID || name_matches(&name, &[
+                        "Load unpacked", "Carregar sem compactação",
+                        "Carregar descompactada", "Carregar extensão não empacotada",
+                    ]))
+                }))
+                .depth(30).timeout(8_000).find_all()
+                .map_err(|error| format!("Chrome did not expose Load unpacked: {error}"))?;
+            let load = exactly_one(buttons, "Load unpacked button")?;
+            invoke(&load, "Load unpacked")?;
+            Self::choose_extension_folder(automation, window, extension_path)?;
+
+            let deadline = Instant::now() + Duration::from_secs(25);
+            loop {
+                if let Some(id) = registration::registered_id(&profile, extension_path)? {
+                    if expected_id.is_some_and(|expected| expected != id) {
+                        return Err("Chrome registered this folder with a different ID; no other extension was changed".into());
+                    }
+                    let after = registration::load_stamp(&profile, extension_path)?;
+                    if after.is_some() && after != before {
+                        verify_local_version(extension_path, expected_version)?;
+                        registration::verify(&profile, extension_path, &id)?;
+                        return Ok(id);
+                    }
+                }
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "Chrome did not confirm loading {}. Its installation timestamp did not change; check Chrome's Load unpacked error",
+                        extension_path.display()
+                    ));
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+        })
     }
 
     fn find_extension_card(
@@ -316,47 +372,21 @@ impl WindowsChromeAutomation {
 }
 
 impl BrowserAutomationBackend for WindowsChromeAutomation {
+    fn registered_id(&self, extension_path: &Path) -> Result<Option<String>, String> {
+        let profile = Self::profile_directory()?;
+        if !profile.is_dir() {
+            return Ok(None);
+        }
+        registration::registered_id(&profile, extension_path)
+    }
+
     fn preflight(&self) -> Result<(), String> {
         Self::chrome_path().map(|_| ())
     }
 
     fn install(&self, extension_path: &Path, expected_version: &str) -> Result<String, String> {
-        self.preflight()?;
-        if !extension_path.join("manifest.json").is_file() {
-            return Err("The prepared extension does not contain manifest.json".into());
-        }
-        let profile = Self::profile_directory()?;
-        if let Some(chrome_id) = registration::registered_id(&profile, extension_path)? {
-            self.reload(extension_path, &chrome_id, expected_version)?;
-            return Ok(chrome_id);
-        }
-        self.with_extensions_page(|automation, window| {
-            let load = automation
-                .create_matcher()
-                .from(window.clone())
-                .control_type(ControlType::Button)
-                .filter_fn(Box::new(|element: &UIElement| {
-                    Ok(element.get_automation_id()? == LOAD_UNPACKED_ID)
-                }))
-                .depth(25)
-                .timeout(8_000)
-                .find_first()
-                .map_err(|_| format!("Chrome did not expose the #{LOAD_UNPACKED_ID} button"))?;
-            invoke(&load, "Load unpacked")?;
-            Self::choose_extension_folder(automation, extension_path)?;
-            let deadline = Instant::now() + Duration::from_secs(15);
-            let chrome_id = loop {
-                if let Some(id) = registration::registered_id(&profile, extension_path)? {
-                    break id;
-                }
-                if Instant::now() >= deadline {
-                    return Err("Chrome did not register the requested extension directory; no ID was saved".into());
-                }
-                thread::sleep(Duration::from_millis(200));
-            };
-            self.verify_with_window(automation, window, &chrome_id, expected_version)?;
-            Ok(chrome_id)
-        })
+        let existing = self.registered_id(extension_path)?;
+        self.load_folder(extension_path, expected_version, existing.as_deref())
     }
 
     fn verify_identity(
@@ -378,20 +408,8 @@ impl BrowserAutomationBackend for WindowsChromeAutomation {
         expected_version: &str,
     ) -> Result<(), String> {
         self.verify_identity(extension_path, chrome_extension_id)?;
-        self.with_extensions_page(|automation, window| {
-            self.verify_identity(extension_path, chrome_extension_id)?;
-            let reload = Self::find_extension_button(
-                automation,
-                window,
-                chrome_extension_id,
-                RELOAD_BUTTON_IDS,
-                "Reload",
-            )
-            .map_err(|_| format!("Reload was not found for {chrome_extension_id}"))?;
-            invoke(&reload, "Reload")?;
-            thread::sleep(Duration::from_millis(700));
-            self.verify_with_window(automation, window, chrome_extension_id, expected_version)
-        })
+        self.load_folder(extension_path, expected_version, Some(chrome_extension_id))?;
+        Ok(())
     }
 
     fn remove(&self, extension_path: &Path, chrome_extension_id: &str) -> Result<(), String> {
@@ -462,35 +480,19 @@ impl BrowserAutomationBackend for WindowsChromeAutomation {
     }
 }
 
-impl WindowsChromeAutomation {
-    fn verify_with_window(
-        &self,
-        automation: &UIAutomation,
-        window: &UIElement,
-        chrome_extension_id: &str,
-        expected_version: &str,
-    ) -> Result<(), String> {
-        let card = Self::find_extension_card(automation, window, chrome_extension_id)?;
-        let expected = expected_version.to_string();
-        automation
-            .create_matcher()
-            .from(card)
-            .filter_fn(Box::new(move |element: &UIElement| {
-                let name = element.get_name()?;
-                Ok(name == expected
-                    || name == format!("Version {expected}")
-                    || name == format!("Versão {expected}"))
-            }))
-            .depth(12)
-            .timeout(5_000)
-            .find_first()
-            .map_err(|_| {
-                format!(
-                    "Chrome found {chrome_extension_id}, but did not confirm version {expected_version}"
-                )
-            })?;
-        Ok(())
+fn verify_local_version(extension_path: &Path, expected_version: &str) -> Result<(), String> {
+    let manifest: crate::model::ChromeManifest = serde_json::from_slice(
+        &std::fs::read(extension_path.join("manifest.json"))
+            .map_err(|error| format!("Could not read the extension manifest: {error}"))?,
+    )
+    .map_err(|error| format!("The extension manifest is invalid: {error}"))?;
+    if manifest.version != expected_version {
+        return Err(format!(
+            "Local manifest version {} differs from the requested version {expected_version}",
+            manifest.version
+        ));
     }
+    Ok(())
 }
 
 fn chrome_windows(automation: &UIAutomation) -> Vec<UIElement> {

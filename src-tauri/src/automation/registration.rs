@@ -7,6 +7,23 @@ use serde_json::Value;
 // Read-only: Chrome owns these files. Never infer ownership from a UI label,
 // a version number, or an ID previously saved by NoX.
 pub fn registered_id(profile: &Path, extension_path: &Path) -> Result<Option<String>, String> {
+    id_for_path(&read_settings(profile)?, extension_path)
+}
+
+// Chromium updates last_update_time when UnpackedInstaller finishes installing
+// the directory, including when the same unpacked extension is loaded again.
+pub fn load_stamp(profile: &Path, extension_path: &Path) -> Result<Option<String>, String> {
+    let settings = read_settings(profile)?;
+    let id = id_for_path(&settings, extension_path)?;
+    Ok(id.and_then(|id| {
+        settings
+            .get(&id)
+            .and_then(|entry| entry.get("last_update_time"))
+            .map(Value::to_string)
+    }))
+}
+
+fn read_settings(profile: &Path) -> Result<BTreeMap<String, Value>, String> {
     let mut settings = BTreeMap::new();
     let mut found_preferences = false;
     for name in ["Preferences", "Secure Preferences"] {
@@ -39,14 +56,14 @@ pub fn registered_id(profile: &Path, extension_path: &Path) -> Result<Option<Str
             "Chrome's Default profile could not be read; no extension action was performed".into(),
         );
     }
-    id_for_path(&settings, extension_path)
+    Ok(settings)
 }
 
 pub fn verify(profile: &Path, extension_path: &Path, expected_id: &str) -> Result<(), String> {
     let actual = registered_id(profile, extension_path)?;
     if actual.as_deref() != Some(expected_id) {
         return Err(format!(
-            "Chrome ID {expected_id} does not belong to {} in the Default profile; action blocked. Use Repair to reconnect this extension",
+            "Chrome ID {expected_id} does not belong to {} in the Default profile; action blocked. Sync to refresh the Chrome registration",
             extension_path.display()
         ));
     }

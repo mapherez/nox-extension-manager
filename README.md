@@ -23,7 +23,12 @@ adapters.
 - Automates Install, Update, Remove and Repair through Windows UI Automation.
   Chrome's read-only profile registrations must associate the requested
   directory with the exact Chrome ID before an action can proceed. Controls
-  must belong to that exact extension card; ambiguous controls are rejected.
+  used for removal must belong to that exact extension card. Installation and
+  update load the exact folder through Load unpacked, and wait for Chrome's
+  registration timestamp to change; they never search for a Reload button.
+- Rebuilds installation records from Chrome's profile registrations and the
+  local manifest on every snapshot and sync. A downloaded manifest alone does
+  not count as installed unless Chrome actually registers that directory.
 - Includes the app updater UI, signed updater artifacts and persistent footer
   status after dismissing the update banner.
 
@@ -57,14 +62,14 @@ downloads it again even if the manifest version has not changed. If NoX's
 repository state was reset, existing directories are accepted only when all
 their file hashes match the repository; differing files are left untouched.
 
-For manual edits or an incorrect saved Chrome registration, choose
-**Restore & repair** on that extension. After confirmation, NoX preserves the
-current files under `.nox/backups/<extension-id>/before-repair-*`, restores the
+For modified local files, choose **Restore files** on that extension. This
+action is not shown on normally installed extensions. After confirmation, NoX
+preserves the current files under `.nox/backups/<extension-id>/before-repair-*`, restores the
 repository files, and reconnects Chrome using the directory's actual
-registration. It never removes another extension to repair a registration.
+registration. Stale NoX IDs are reconciled automatically from Chrome's profile.
 
 Deleting `.nox` also deletes installation records, integrity snapshots and
-backups. Use Sync or Restore & repair for recovery instead. A failed ownership
+backups. Use Sync or Restore files for recovery instead. A failed ownership
 check blocks the action before any Remove or Reload is invoked.
 
 ## Development
@@ -110,9 +115,13 @@ To publish signed updates:
 
 The workflow builds signed Tauri updater artifacts, uploads the installers and
 signatures with stable asset names, and generates `latest.json` using the actual
-`browser_download_url` returned by GitHub. The update manifest is uploaded last,
-after all artifact uploads have been confirmed. Dry-run and skip-upload modes
-generate preview URLs only; they do not resolve published GitHub download URLs.
+asset name returned by GitHub with the final release tag. Draft `untagged-*`
+download URLs are never embedded in the manifest, since they expire on publish.
+The update manifest is uploaded last, after all artifact uploads have been
+confirmed. Published installer URLs are checked with HEAD before the manifest
+is uploaded; drafts use final-tag URLs which become public on publication.
+Dry-run and skip-upload modes generate preview URLs only; they do not resolve
+published GitHub download URLs.
 Authenticode signing is intentionally outside the pilot MVP.
 
 ## Verification scope

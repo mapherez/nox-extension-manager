@@ -2,6 +2,7 @@ use std::path::Path;
 
 pub trait BrowserAutomationBackend: Send + Sync {
     fn preflight(&self) -> Result<(), String>;
+    fn registered_id(&self, extension_path: &Path) -> Result<Option<String>, String>;
     fn install(&self, extension_path: &Path, expected_version: &str) -> Result<String, String>;
     fn verify_identity(
         &self,
@@ -44,6 +45,10 @@ impl BrowserAutomationBackend for UnsupportedAutomation {
     fn install(&self, _: &Path, _: &str) -> Result<String, String> {
         self.preflight()?;
         unreachable!()
+    }
+
+    fn registered_id(&self, _: &Path) -> Result<Option<String>, String> {
+        Ok(None)
     }
 
     fn verify_identity(&self, _: &Path, _: &str) -> Result<(), String> {

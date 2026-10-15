@@ -247,15 +247,13 @@ impl RepositoryClient {
         let existing = state.extensions.get(id).cloned();
         let version_order = existing
             .as_ref()
-            .filter(|entry| !entry.remote_version.is_empty())
-            .map(|entry| compare_versions(&manifest.version, &entry.remote_version))
+            .and_then(|entry| {
+                entry.active_version.as_deref().or_else(|| {
+                    (!entry.remote_version.is_empty()).then_some(entry.remote_version.as_str())
+                })
+            })
+            .map(|version| compare_versions(&manifest.version, version))
             .transpose()?;
-        if version_order == Some(Ordering::Less) {
-            return Err(format!(
-                "Repository version {} is older than the last downloaded version",
-                manifest.version
-            ));
-        }
 
         let active_missing = !paths.extension_dir(id).exists();
         let pending_missing = existing.as_ref().is_some_and(|entry| {
@@ -264,10 +262,13 @@ impl RepositoryClient {
                 .as_ref()
                 .is_some_and(|version| !paths.pending_dir(id, version).is_dir())
         });
-        if version_order == Some(Ordering::Equal)
+        if version_order.is_some_and(|order| order != Ordering::Greater)
             && !active_missing
             && !pending_missing
             && !restore_local
+            && existing
+                .as_ref()
+                .is_some_and(|entry| !entry.active_hashes.is_empty())
         {
             let preferred_icon = manifest.preferred_icon();
             let entry = state.extensions.get_mut(id).expect("existing entry");
@@ -275,6 +276,9 @@ impl RepositoryClient {
             entry.name = manifest.name;
             entry.description = manifest.description;
             entry.icon_relative_path = preferred_icon;
+            entry.remote_version = manifest.version;
+            entry.pending_version = None;
+            entry.pending_hashes.clear();
             if entry
                 .problem
                 .as_deref()
@@ -283,6 +287,21 @@ impl RepositoryClient {
                 entry.problem = None;
             }
             return Ok(());
+        }
+
+        if !restore_local && !active_missing {
+            if let Some(previous) = &existing {
+                if previous.pending_version.as_deref() == Some(&manifest.version)
+                    && paths.pending_dir(id, &manifest.version).is_dir()
+                    && hash_directory(&paths.pending_dir(id, &manifest.version))?
+                        == previous.pending_hashes
+                {
+                    let entry = state.extensions.get_mut(id).expect("existing entry");
+                    entry.available = true;
+                    entry.remote_version = manifest.version;
+                    return Ok(());
+                }
+            }
         }
 
         if let Some(previous) = &existing {
@@ -333,6 +352,23 @@ impl RepositoryClient {
         entry.available = true;
         entry.remote_files = files;
         entry.problem = None;
+
+        // Rebuild lost NoX metadata only after every local file matches the
+        // downloaded repository snapshot. No active files are overwritten.
+        if installed
+            && !active_missing
+            && unmanaged
+            && version_order == Some(Ordering::Equal)
+            && !restore_local
+        {
+            fs::remove_dir_all(&downloaded_dir).map_err(|error| error.to_string())?;
+            entry.active_version = Some(manifest.version);
+            entry.active_hashes = hashes;
+            entry.pending_version = None;
+            entry.pending_hashes.clear();
+            state.extensions.insert(id.to_string(), entry);
+            return Ok(());
+        }
 
         if installed && !active_missing && !restore_local {
             let pending = paths.pending_dir(id, &manifest.version);

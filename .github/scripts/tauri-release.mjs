@@ -126,6 +126,16 @@ for (const assetPath of artifactAssets) {
 }
 
 // Publish the manifest last, only after every installer and signature exists.
+if (!release.draft) {
+  for (const candidate of selected) {
+    const asset = uploadedAssets.get(path.resolve(candidate.assetPath));
+    const url = releaseAssetUrl(repository, tagName, asset.name);
+    const response = await fetch(url, { method: 'HEAD', redirect: 'follow' });
+    if (!response.ok) {
+      fail(`Published installer URL returned ${response.status}: ${url}; latest.json was not published.`);
+    }
+  }
+}
 await writeLatestJson(uploadedAssets);
 await uploadReleaseAsset({
   repository,
@@ -141,14 +151,14 @@ console.log(`Release ${tagName} is ready: https://github.com/${repository}/relea
 async function writeLatestJson(uploadedAssets) {
   const platforms = Object.fromEntries(selected.map((candidate) => {
     const uploaded = uploadedAssets?.get(path.resolve(candidate.assetPath));
-    if (uploadedAssets && !uploaded?.browser_download_url) {
-      fail(`GitHub did not return a download URL for ${candidate.uploadName}; latest.json was not published.`);
+    if (uploadedAssets && !uploaded?.name) {
+      fail(`GitHub did not return the asset name for ${candidate.uploadName}; latest.json was not published.`);
     }
     return [candidate.platform, {
       signature: signatures.get(candidate.platform),
-      url: uploadedAssets
-        ? uploaded.browser_download_url
-        : releaseAssetUrl(repository, tagName, candidate.uploadName),
+      // Draft uploads may return an untagged-* URL which expires on publish.
+      // Use GitHub's actual asset name with the final release tag instead.
+      url: releaseAssetUrl(repository, tagName, uploadedAssets ? uploaded.name : candidate.uploadName),
     }];
   }));
   const latestJson = { version, notes: releaseNotes, pub_date: pubDate, platforms };
@@ -375,7 +385,7 @@ async function uploadReleaseAsset({ repository, token, release, assetPath, asset
   }
 
   const uploaded = await response.json();
-  if (uploaded.state !== 'uploaded' || uploaded.size !== fileInfo.size || !uploaded.browser_download_url) {
+  if (uploaded.state !== 'uploaded' || uploaded.size !== fileInfo.size || !uploaded.name) {
     fail(`GitHub did not confirm a complete upload for ${assetName}; latest.json was not published.`);
   }
   return uploaded;

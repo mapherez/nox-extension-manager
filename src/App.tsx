@@ -28,6 +28,7 @@ function App() {
   const error = useManagerStore((state) => state.error);
   const notice = useManagerStore((state) => state.notice);
   const retryOperation = useManagerStore((state) => state.retryOperation);
+  const retryExtensionId = retryOperation && 'id' in retryOperation ? retryOperation.id : null;
   const initialize = useManagerStore((state) => state.initialize);
   const sync = useManagerStore((state) => state.sync);
   const runAction = useManagerStore((state) => state.runAction);
@@ -102,8 +103,9 @@ function App() {
       {confirmTarget ? <ConfirmDialog extension={confirmTarget.extension} action={confirmTarget.action} onCancel={() => setConfirmTarget(null)}
         onConfirm={() => { void runAction(confirmTarget.action, confirmTarget.extension.id); setConfirmTarget(null); }} /> : null}
       {error ? <ErrorDialog message={error} repositoryUrl={snapshot?.repositoryUrl}
-        repairId={retryOperation && retryOperation.action !== 'sync' && retryOperation.action !== 'install'
-          ? retryOperation.id : null}
+        repairId={retryExtensionId
+          && snapshot?.extensions.some((entry) => entry.id === retryExtensionId && entry.status === 'locallyModified')
+          ? retryExtensionId : null}
         onRepair={(id) => { clearError(); act('repair', id); }}
         onClose={clearError} onRetry={() => void retry()} /> : null}
       {notice ? <div className="toast"><CheckCircle2 size={18} />{notice}</div> : null}
@@ -143,9 +145,9 @@ export function ExtensionCard({ extension, index, busy, downloading, disabled, o
     </div>
     <div className={`status-pill pill-${displayStatus}`}><StatusIcon status={displayStatus} />{statusCopy[displayStatus]}</div>
     <div className="card-actions">
-      {['installed', 'locallyModified', 'error'].includes(extension.status) ? <button className="button button-secondary"
-        disabled={busy || disabled} aria-label={`Restore and repair ${extension.name}`}
-        onClick={() => onAction('repair', extension.id)}><RotateCcw size={18} /> Restore &amp; repair</button> : null}
+      {extension.status === 'locallyModified' ? <button className="button button-secondary"
+        disabled={busy || disabled} aria-label={`Restore repository files for ${extension.name}`}
+        onClick={() => onAction('repair', extension.id)}><RotateCcw size={18} /> Restore files</button> : null}
       {extension.status === 'readyToInstall' ? <button className="button button-primary" disabled={busy || disabled}
         onClick={() => onAction('install', extension.id)}>{busy ? <RefreshCw className="spin" size={18} /> : <Download size={18} />} Install</button> : null}
       {extension.status === 'updateReady' ? <button className="button button-primary" disabled={busy || disabled}
@@ -225,10 +227,10 @@ export function ConfirmDialog({ extension, action, onCancel, onConfirm }: { exte
   return <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onCancel()}>
     <section className="dialog" role="alertdialog" aria-modal="true" aria-labelledby="remove-title">
       <div className="dialog-icon danger">{repair ? <RotateCcw size={22} /> : <Trash2 size={22} />}</div>
-      <h2 id="remove-title">{repair ? `Restore and repair ${extension.name}?` : `Remove ${extension.name} from Chrome?`}</h2>
+      <h2 id="remove-title">{repair ? `Restore repository files for ${extension.name}?` : `Remove ${extension.name} from Chrome?`}</h2>
       <p>{repair ? 'The repository version will replace this extension’s local files. A backup of the current files will be kept in .nox/backups. Only this extension will be reconnected in Chrome.' : 'The local files will stay in Documents, ready to install again.'}</p>
       <div className="dialog-actions"><button ref={cancelButton} className="button button-secondary" onClick={onCancel}>Cancel</button>
-        <button className="button button-danger-solid" onClick={onConfirm}>{repair ? 'Restore & repair' : 'Remove'}</button></div>
+        <button className="button button-danger-solid" onClick={onConfirm}>{repair ? 'Restore files' : 'Remove'}</button></div>
     </section></div>;
 }
 
@@ -270,7 +272,7 @@ function ErrorDialog({ message, repositoryUrl, repairId, onClose, onRetry, onRep
                 className="button button-secondary"
                 onClick={() => onRepair(repairId)}
               >
-                <RotateCcw size={17} /> Repair
+                <RotateCcw size={17} /> Restore files
               </button>
             ) : null}
             <button className="button button-primary" onClick={onRetry}>

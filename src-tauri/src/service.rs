@@ -1,11 +1,15 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::sync::Arc;
 
 use chrono::Utc;
 
 use crate::automation::BrowserAutomationBackend;
-use crate::model::{ChromeInstallRecord, ExtensionActionResult, ManagerSnapshot, RepositoryConfig};
-use crate::repository::{build_snapshot, hash_directory, RepositoryClient};
+use crate::model::{
+    ChromeInstallRecord, ChromeManifest, ChromeState, ExtensionActionResult, ManagedExtension,
+    ManagerSnapshot, RepositoryConfig, RepositoryState,
+};
+use crate::repository::{build_snapshot, compare_versions, hash_directory, RepositoryClient};
 use crate::storage::StoragePaths;
 
 pub struct ManagerService {
@@ -31,8 +35,10 @@ impl ManagerService {
     }
 
     pub fn snapshot(&self) -> Result<ManagerSnapshot, String> {
-        let repository = self.paths.load_repository_state()?;
-        let chrome = self.paths.load_chrome_state()?;
+        let mut repository = self.paths.load_repository_state()?;
+        self.refresh_local_manifests(&mut repository)?;
+        self.paths.save_repository_state(&repository)?;
+        let chrome = self.chrome_state(&repository)?;
         Ok(build_snapshot(
             &self.paths,
             &repository,
@@ -43,7 +49,8 @@ impl ManagerService {
 
     pub async fn sync(&mut self) -> Result<ManagerSnapshot, String> {
         let mut repository = self.paths.load_repository_state()?;
-        let chrome = self.paths.load_chrome_state()?;
+        self.refresh_local_manifests(&mut repository)?;
+        let chrome = self.chrome_state(&repository)?;
         self.paths.log("Extension synchronization started");
         self.repository
             .sync(&self.paths, &mut repository, &chrome)
@@ -54,6 +61,7 @@ impl ManagerService {
                 error
             })?;
         self.paths.log("Extension synchronization completed");
+        let chrome = self.chrome_state(&repository)?;
         Ok(build_snapshot(
             &self.paths,
             &repository,
@@ -63,10 +71,15 @@ impl ManagerService {
     }
 
     pub async fn install(&mut self, id: &str) -> Result<ExtensionActionResult, String> {
-        let repository = self.paths.load_repository_state()?;
-        let mut chrome = self.paths.load_chrome_state()?;
+        let mut repository = self.paths.load_repository_state()?;
+        self.refresh_local_manifests(&mut repository)?;
+        let mut chrome = self.chrome_state(&repository)?;
         if chrome.extensions.contains_key(id) {
-            return Err(format!("{id} is already registered as installed"));
+            return self.result(
+                "This extension is already installed in Chrome",
+                &repository,
+                &chrome,
+            );
         }
         let extension = repository
             .extensions
@@ -102,7 +115,8 @@ impl ManagerService {
 
     pub async fn update(&mut self, id: &str) -> Result<ExtensionActionResult, String> {
         let mut repository = self.paths.load_repository_state()?;
-        let mut chrome = self.paths.load_chrome_state()?;
+        self.refresh_local_manifests(&mut repository)?;
+        let mut chrome = self.chrome_state(&repository)?;
         let installed = chrome
             .extensions
             .get(id)
@@ -206,8 +220,9 @@ impl ManagerService {
     }
 
     pub async fn remove(&mut self, id: &str) -> Result<ExtensionActionResult, String> {
-        let repository = self.paths.load_repository_state()?;
-        let mut chrome = self.paths.load_chrome_state()?;
+        let mut repository = self.paths.load_repository_state()?;
+        self.refresh_local_manifests(&mut repository)?;
+        let mut chrome = self.chrome_state(&repository)?;
         let installed = chrome
             .extensions
             .get(id)
@@ -234,7 +249,8 @@ impl ManagerService {
 
     pub async fn repair(&mut self, id: &str) -> Result<ExtensionActionResult, String> {
         let mut repository = self.paths.load_repository_state()?;
-        let mut chrome = self.paths.load_chrome_state()?;
+        self.refresh_local_manifests(&mut repository)?;
+        let mut chrome = self.chrome_state(&repository)?;
         self.repository
             .restore_files(&self.paths, &mut repository, &chrome, id)
             .await?;
@@ -269,6 +285,100 @@ impl ManagerService {
         );
         self.paths.save_chrome_state(&chrome)?;
         self.result("Repository files restored and Chrome installation repaired; previous files were backed up", &repository, &chrome)
+    }
+
+    fn refresh_local_manifests(&self, repository: &mut RepositoryState) -> Result<(), String> {
+        let mut ids: BTreeSet<String> = repository.extensions.keys().cloned().collect();
+        for directory in fs::read_dir(&self.paths.root).map_err(|error| error.to_string())? {
+            let directory = directory.map_err(|error| error.to_string())?;
+            let id = directory.file_name().to_string_lossy().to_string();
+            if !id.is_empty()
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                && directory.path().join("manifest.json").is_file()
+            {
+                ids.insert(id);
+            }
+        }
+        for id in ids {
+            let path = self.paths.extension_dir(&id);
+            let bytes = match fs::read(path.join("manifest.json")) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(format!("Could not read {id}/manifest.json: {error}")),
+            };
+            let manifest: ChromeManifest = match serde_json::from_slice(&bytes) {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    if let Some(entry) = repository.extensions.get_mut(&id) {
+                        entry.problem = Some(format!("Invalid local manifest: {error}"));
+                    }
+                    continue;
+                }
+            };
+            compare_versions(&manifest.version, &manifest.version)?;
+            let entry =
+                repository
+                    .extensions
+                    .entry(id.clone())
+                    .or_insert_with(|| ManagedExtension {
+                        id: id.clone(),
+                        name: manifest.name.clone(),
+                        description: manifest.description.clone(),
+                        ..ManagedExtension::default()
+                    });
+            // Read installed versions from disk, but retain the last trusted
+            // hashes. Recognizing an installation must not authorize overwrites.
+            entry.active_version = Some(manifest.version.clone());
+            if entry.pending_version.as_ref().is_some_and(|pending| {
+                compare_versions(pending, &manifest.version)
+                    .is_ok_and(|order| order != std::cmp::Ordering::Greater)
+            }) {
+                entry.pending_version = None;
+                entry.pending_hashes.clear();
+            }
+            if entry
+                .problem
+                .as_deref()
+                .is_some_and(|problem| problem.starts_with("Invalid local manifest"))
+            {
+                entry.problem = None;
+            }
+        }
+        Ok(())
+    }
+
+    fn chrome_state(&self, repository: &RepositoryState) -> Result<ChromeState, String> {
+        let previous = self.paths.load_chrome_state()?;
+        let mut chrome = ChromeState::default();
+        for (id, extension) in &repository.extensions {
+            if let Some(chrome_id) = self
+                .automation
+                .registered_id(&self.paths.extension_dir(id))?
+            {
+                let old = previous
+                    .extensions
+                    .get(id)
+                    .filter(|record| record.chrome_extension_id == chrome_id);
+                chrome.extensions.insert(
+                    id.clone(),
+                    ChromeInstallRecord {
+                        chrome_extension_id: chrome_id,
+                        version: extension
+                            .active_version
+                            .clone()
+                            .or_else(|| old.map(|record| record.version.clone()))
+                            .unwrap_or_else(|| "unknown".into()),
+                        installed_at: old
+                            .map(|record| record.installed_at.clone())
+                            .unwrap_or_else(|| Utc::now().to_rfc3339()),
+                    },
+                );
+            }
+        }
+        self.paths.save_chrome_state(&chrome)?;
+        Ok(chrome)
     }
 
     fn result(
@@ -343,6 +453,9 @@ mod tests {
     }
 
     impl BrowserAutomationBackend for WrongRegistration {
+        fn registered_id(&self, _: &Path) -> Result<Option<String>, String> {
+            Err("Chrome ID belongs to BetterTTV, not the requested directory".into())
+        }
         fn preflight(&self) -> Result<(), String> {
             Ok(())
         }
