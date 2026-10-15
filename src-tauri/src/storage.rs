@@ -75,7 +75,21 @@ impl StoragePaths {
     }
 
     pub fn load_repository_state(&self) -> Result<RepositoryState, String> {
-        load_json_or_default(&self.repository_state)
+        match load_json_or_default(&self.repository_state) {
+            Ok(state) => Ok(state),
+            Err(error) => {
+                self.log(&format!("Ignoring invalid catalog cache: {error}"));
+                Ok(RepositoryState::default())
+            }
+        }
+    }
+
+    pub fn preferences(&self) -> Result<crate::model::ManagerPreferences, String> {
+        load_json_or_default(&self.internal.join("preferences.json"))
+    }
+
+    pub fn save_preferences(&self, value: &crate::model::ManagerPreferences) -> Result<(), String> {
+        save_json_atomic(&self.internal.join("preferences.json"), value)
     }
 
     pub fn save_repository_state(&self, state: &RepositoryState) -> Result<(), String> {

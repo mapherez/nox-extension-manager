@@ -34,6 +34,8 @@ pub struct ManagedExtension {
     pub active_hashes: BTreeMap<String, String>,
     pub pending_hashes: BTreeMap<String, String>,
     pub problem: Option<String>,
+    #[serde(default)]
+    pub trusted_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -60,6 +62,9 @@ pub struct ChromeState {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ExtensionStatus {
+    NotInstalled,
+    Ambiguous,
+    DetectionUnavailable,
     ReadyToInstall,
     Installed,
     UpdateReady,
@@ -80,6 +85,11 @@ pub struct ExtensionView {
     pub icon_path: Option<String>,
     pub status: ExtensionStatus,
     pub problem: Option<String>,
+    pub download_state: String,
+    pub downloaded_version: Option<String>,
+    pub installations: Vec<ChromeInstallation>,
+    pub requires_overwrite_confirmation: bool,
+    pub overwrite_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -88,6 +98,9 @@ pub struct ManagerSnapshot {
     pub extensions: Vec<ExtensionView>,
     pub last_synced_at: Option<String>,
     pub repository_url: String,
+    pub profiles: Vec<ChromeProfile>,
+    pub selected_profile: String,
+    pub detection_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -115,4 +128,45 @@ impl ChromeManifest {
             .max_by_key(|(size, _)| size.parse::<u32>().unwrap_or_default())
             .map(|(_, path)| path.clone())
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChromeProfile {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChromeInstallation {
+    pub chrome_extension_id: String,
+    pub path: String,
+    pub name: String,
+    pub version: String,
+    pub unpacked: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagerPreferences {
+    pub profile: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActionTarget {
+    pub profile_id: String,
+    pub chrome_extension_id: String,
+    pub path: String,
+    pub version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverwriteConsent {
+    pub profile_id: String,
+    pub path: String,
+    pub hashes: BTreeMap<String, String>,
 }

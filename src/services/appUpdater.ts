@@ -1,6 +1,6 @@
 import { getVersion } from '@tauri-apps/api/app';
-import { invoke, isTauri } from '@tauri-apps/api/core';
-import { exit } from '@tauri-apps/plugin-process';
+import { isTauri } from '@tauri-apps/api/core';
+import { relaunch } from '@tauri-apps/plugin-process';
 import { check, type DownloadEvent, type Update } from '@tauri-apps/plugin-updater';
 
 export type AppUpdateInfo = {
@@ -49,6 +49,6 @@ export async function installAppUpdate(
       percent: totalBytes ? Math.min(100, Math.round((downloadedBytes / totalBytes) * 100)) : null,
     });
   });
-  await invoke('nox_prepare_update_relaunch_with_local_data_reset');
-  await exit(0);
+  // On Windows the native updater exits the app and launches the installer.
+  if (__NOX_PLATFORM__ !== 'windows') await relaunch();
 }

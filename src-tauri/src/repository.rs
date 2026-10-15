@@ -43,6 +43,7 @@ impl RepositoryClient {
     pub fn new(config: RepositoryConfig) -> Result<Self, String> {
         let client = Client::builder()
             .https_only(true)
+            .timeout(std::time::Duration::from_secs(20))
             .build()
             .map_err(|error| format!("Could not initialize the GitHub client: {error}"))?;
         Ok(Self {
@@ -57,84 +58,110 @@ impl RepositoryClient {
         &self.config.repository_url
     }
 
+    // Discovery only: manifests are metadata, never an extension download.
     pub async fn sync(
         &self,
         paths: &StoragePaths,
         state: &mut RepositoryState,
-        chrome: &ChromeState,
+        _chrome: &ChromeState,
     ) -> Result<(), String> {
-        self.sync_inner(paths, state, chrome, None).await
+        let ids = discover_extensions(
+            &self.config.extensions_path,
+            self.fetch_directory(&self.config.extensions_path).await?,
+        )?;
+        for entry in state.extensions.values_mut() {
+            entry.available = false;
+        }
+        for id in ids {
+            match self.read_manifest(&id).await {
+                Ok(Some((manifest, _))) => {
+                    let entry = state.extensions.entry(id.clone()).or_default();
+                    entry.id = id;
+                    entry.icon_relative_path = manifest.preferred_icon();
+                    entry.name = manifest.name;
+                    entry.description = manifest.description;
+                    entry.remote_version = manifest.version;
+                    entry.available = true;
+                    entry.problem = None;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let entry = state.extensions.entry(id.clone()).or_default();
+                    entry.id = id.clone();
+                    if entry.name.is_empty() {
+                        entry.name = id;
+                    }
+                    entry.problem = Some(error);
+                }
+            }
+        }
+        state.last_synced_at = Some(Utc::now().to_rfc3339());
+        paths.save_repository_state(state)
     }
 
+    async fn read_manifest(&self, id: &str) -> Result<Option<(ChromeManifest, Vec<u8>)>, String> {
+        validate_id(id)?;
+        let key = Utc::now()
+            .timestamp_nanos_opt()
+            .unwrap_or_default()
+            .to_string();
+        let Some(bytes) = self.fetch_raw_file(id, "manifest.json", &key).await? else {
+            return Ok(None);
+        };
+        let manifest: ChromeManifest = serde_json::from_slice(&bytes)
+            .map_err(|e| format!("{id}/manifest.json is invalid: {e}"))?;
+        validate_manifest(id, &manifest)?;
+        Ok(Some((manifest, bytes)))
+    }
+
+    pub async fn download(
+        &self,
+        paths: &StoragePaths,
+        state: &mut RepositoryState,
+        id: &str,
+    ) -> Result<(), String> {
+        let catalog = state
+            .extensions
+            .get(id)
+            .ok_or_else(|| format!("Unknown extension: {id}"))?;
+        if !catalog.available || catalog.problem.is_some() {
+            return Err("Sync the catalog before downloading".into());
+        }
+        let (manifest, bytes) = self
+            .read_manifest(id)
+            .await?
+            .ok_or("The remote manifest is missing")?;
+        if manifest.name != catalog.name || manifest.version != catalog.remote_version {
+            return Err("The repository manifest changed; Sync before downloading".into());
+        }
+        let files = self.extension_files(id).await?;
+        let file = files
+            .iter()
+            .find(|file| file.path == "manifest.json")
+            .ok_or("Remote manifest disappeared")?;
+        verify_git_oid(&bytes, &file.oid)?;
+        let (staging, hashes) = self.download_extension(paths, id, &files, &bytes).await?;
+        let destination = paths.pending_dir(id, &manifest.version);
+        replace_directory(&staging, &destination, &paths.backups)?;
+        let entry = state
+            .extensions
+            .get_mut(id)
+            .ok_or("Catalog entry disappeared")?;
+        entry.pending_version = Some(manifest.version);
+        entry.pending_hashes = hashes;
+        entry.remote_files = files;
+        paths.save_repository_state(state)
+    }
+
+    #[cfg(test)]
     pub async fn restore_files(
         &self,
         paths: &StoragePaths,
         state: &mut RepositoryState,
-        chrome: &ChromeState,
+        _chrome: &ChromeState,
         id: &str,
     ) -> Result<(), String> {
-        self.sync_inner(paths, state, chrome, Some(id)).await?;
-        let entry = state
-            .extensions
-            .get(id)
-            .ok_or_else(|| format!("Unknown extension: {id}"))?;
-        if let Some(problem) = &entry.problem {
-            return Err(problem.clone());
-        }
-        Ok(())
-    }
-
-    async fn sync_inner(
-        &self,
-        paths: &StoragePaths,
-        state: &mut RepositoryState,
-        chrome: &ChromeState,
-        repair_id: Option<&str>,
-    ) -> Result<(), String> {
-        refresh_local_integrity(paths, state, repair_id)?;
-
-        let directory = self.fetch_directory(&self.config.extensions_path).await?;
-        let discovered = discover_extensions(&self.config.extensions_path, directory)?;
-        if let Some(id) = repair_id {
-            if !discovered.contains(id) {
-                return Err(format!(
-                    "{id} is no longer available in the repository; repair blocked"
-                ));
-            }
-        }
-
-        for extension in state.extensions.values_mut() {
-            if repair_id.is_none() || repair_id == Some(extension.id.as_str()) {
-                extension.available = false;
-            }
-        }
-
-        for id in discovered {
-            if repair_id.is_some_and(|target| target != id) {
-                continue;
-            }
-            if let Err(error) = self
-                .sync_extension(paths, state, chrome, &id, repair_id == Some(id.as_str()))
-                .await
-            {
-                paths.log(&format!("Could not synchronize {id}: {error}"));
-                let entry =
-                    state
-                        .extensions
-                        .entry(id.clone())
-                        .or_insert_with(|| ManagedExtension {
-                            id: id.clone(),
-                            name: id.clone(),
-                            available: true,
-                            ..ManagedExtension::default()
-                        });
-                entry.available = true;
-                entry.problem = Some(error);
-            }
-        }
-
-        state.last_synced_at = Some(Utc::now().to_rfc3339());
-        paths.save_repository_state(state)
+        self.download(paths, state, id).await
     }
 
     async fn fetch_directory(&self, directory: &str) -> Result<Vec<GitHubContentItem>, String> {
@@ -215,207 +242,6 @@ impl RepositoryClient {
         }
         files.sort_by(|left, right| left.path.cmp(&right.path));
         Ok(files)
-    }
-
-    async fn sync_extension(
-        &self,
-        paths: &StoragePaths,
-        state: &mut RepositoryState,
-        chrome: &ChromeState,
-        id: &str,
-        restore_local: bool,
-    ) -> Result<(), String> {
-        validate_id(id)?;
-        // Read each manifest on every sync. Extension versions, not changes
-        // elsewhere in the repository, decide whether an update is available.
-        let cache_key = Utc::now()
-            .timestamp_nanos_opt()
-            .unwrap_or_default()
-            .to_string();
-        let Some(manifest_bytes) = self.fetch_raw_file(id, "manifest.json", &cache_key).await?
-        else {
-            if restore_local {
-                return Err(format!(
-                    "{id}/manifest.json is no longer available; repair blocked"
-                ));
-            }
-            return Ok(()); // A directory without a root manifest is not an extension.
-        };
-        let manifest: ChromeManifest = serde_json::from_slice(&manifest_bytes)
-            .map_err(|error| format!("{id}/manifest.json is invalid: {error}"))?;
-        validate_manifest(id, &manifest)?;
-        let existing = state.extensions.get(id).cloned();
-        let version_order = existing
-            .as_ref()
-            .and_then(|entry| {
-                entry.active_version.as_deref().or_else(|| {
-                    (!entry.remote_version.is_empty()).then_some(entry.remote_version.as_str())
-                })
-            })
-            .map(|version| compare_versions(&manifest.version, version))
-            .transpose()?;
-
-        let active_missing = !paths.extension_dir(id).exists();
-        let pending_missing = existing.as_ref().is_some_and(|entry| {
-            entry
-                .pending_version
-                .as_ref()
-                .is_some_and(|version| !paths.pending_dir(id, version).is_dir())
-        });
-        if version_order.is_some_and(|order| order != Ordering::Greater)
-            && !active_missing
-            && !pending_missing
-            && !restore_local
-            && existing
-                .as_ref()
-                .is_some_and(|entry| !entry.active_hashes.is_empty())
-        {
-            let preferred_icon = manifest.preferred_icon();
-            let entry = state.extensions.get_mut(id).expect("existing entry");
-            entry.available = true;
-            entry.name = manifest.name;
-            entry.description = manifest.description;
-            entry.icon_relative_path = preferred_icon;
-            entry.remote_version = manifest.version;
-            entry.pending_version = None;
-            entry.pending_hashes.clear();
-            if entry
-                .problem
-                .as_deref()
-                .is_some_and(|problem| !problem.starts_with("Local files have changed"))
-            {
-                entry.problem = None;
-            }
-            return Ok(());
-        }
-
-        if !restore_local && !active_missing {
-            if let Some(previous) = &existing {
-                if previous.pending_version.as_deref() == Some(&manifest.version)
-                    && paths.pending_dir(id, &manifest.version).is_dir()
-                    && hash_directory(&paths.pending_dir(id, &manifest.version))?
-                        == previous.pending_hashes
-                {
-                    let entry = state.extensions.get_mut(id).expect("existing entry");
-                    entry.available = true;
-                    entry.remote_version = manifest.version;
-                    return Ok(());
-                }
-            }
-        }
-
-        if let Some(previous) = &existing {
-            if !restore_local
-                && !previous.active_hashes.is_empty()
-                && local_files_changed(paths, previous)?
-            {
-                return Err(
-                    "Local files have changed since the last NoX download; update blocked".into(),
-                );
-            }
-        }
-
-        let files = self.extension_files(id).await?;
-        let manifest_file = files
-            .iter()
-            .find(|file| file.path == "manifest.json")
-            .ok_or_else(|| {
-                format!("{id}/manifest.json disappeared while downloading; sync again")
-            })?;
-        verify_git_oid(&manifest_bytes, &manifest_file.oid)?;
-
-        let (downloaded_dir, hashes) = self
-            .download_extension(paths, id, &files, &manifest_bytes)
-            .await?;
-        let destination = paths.extension_dir(id);
-        let unmanaged = existing
-            .as_ref()
-            .is_none_or(|entry| entry.active_hashes.is_empty());
-        if !restore_local
-            && unmanaged
-            && destination.exists()
-            && hash_directory(&destination)? != hashes
-        {
-            let _ = fs::remove_dir_all(&downloaded_dir);
-            return Err("Local files already exist and differ from the repository; use Repair to restore them with a backup".into());
-        }
-        let installed = chrome.extensions.contains_key(id);
-        let mut entry = existing.unwrap_or_else(|| ManagedExtension {
-            id: id.to_string(),
-            ..ManagedExtension::default()
-        });
-        let preferred_icon = manifest.preferred_icon();
-        entry.name = manifest.name;
-        entry.description = manifest.description;
-        entry.remote_version = manifest.version.clone();
-        entry.icon_relative_path = preferred_icon;
-        entry.available = true;
-        entry.remote_files = files;
-        entry.problem = None;
-
-        // Rebuild lost NoX metadata only after every local file matches the
-        // downloaded repository snapshot. No active files are overwritten.
-        if installed
-            && !active_missing
-            && unmanaged
-            && version_order == Some(Ordering::Equal)
-            && !restore_local
-        {
-            fs::remove_dir_all(&downloaded_dir).map_err(|error| error.to_string())?;
-            entry.active_version = Some(manifest.version);
-            entry.active_hashes = hashes;
-            entry.pending_version = None;
-            entry.pending_hashes.clear();
-            state.extensions.insert(id.to_string(), entry);
-            return Ok(());
-        }
-
-        if installed && !active_missing && !restore_local {
-            let pending = paths.pending_dir(id, &manifest.version);
-            replace_directory(&downloaded_dir, &pending, &paths.backups)?;
-            entry.pending_version = Some(manifest.version);
-            entry.pending_hashes = hashes;
-        } else {
-            if restore_local && destination.exists() {
-                let backup = paths.backup_dir(id).join(format!(
-                    "before-repair-{}",
-                    Utc::now().timestamp_nanos_opt().unwrap_or_default()
-                ));
-                fs::create_dir_all(paths.backup_dir(id)).map_err(|error| error.to_string())?;
-                fs::rename(&destination, &backup).map_err(|error| {
-                    format!("Could not preserve local files before repair: {error}")
-                })?;
-                if let Err(error) = fs::rename(&downloaded_dir, &destination) {
-                    let rollback = fs::rename(&backup, &destination);
-                    return Err(format!("Could not restore repository files: {error}; backup rollback: {rollback:?}"));
-                }
-                paths.log(&format!("Preserved files for {id} at {}", backup.display()));
-            } else {
-                replace_directory(&downloaded_dir, &destination, &paths.backups)?;
-            }
-            entry.active_version = Some(manifest.version);
-            entry.active_hashes = hashes;
-            entry.pending_version = None;
-            entry.pending_hashes.clear();
-            if installed && !restore_local {
-                // Restore deleted files immediately, but still require an explicit
-                // Update to reload the registered Chrome extension.
-                let pending = paths.pending_dir(id, &entry.remote_version);
-                let recovered = paths.staging.join(format!(
-                    "recovered-{id}-{}",
-                    Utc::now().timestamp_nanos_opt().unwrap_or_default()
-                ));
-                fs::create_dir_all(&recovered)
-                    .map_err(|error| format!("Could not prepare recovered update: {error}"))?;
-                copy_directory(&destination, &recovered)?;
-                replace_directory(&recovered, &pending, &paths.backups)?;
-                entry.pending_version = Some(entry.remote_version.clone());
-                entry.pending_hashes = entry.active_hashes.clone();
-            }
-        }
-
-        state.extensions.insert(id.to_string(), entry);
-        Ok(())
     }
 
     async fn download_extension(
@@ -545,62 +371,45 @@ impl RepositoryClient {
 mod sync_tests;
 
 pub fn build_snapshot(
-    paths: &StoragePaths,
+    _paths: &StoragePaths,
     state: &RepositoryState,
-    chrome: &ChromeState,
+    _chrome: &ChromeState,
     repository_url: &str,
 ) -> ManagerSnapshot {
     let mut extensions: Vec<_> = state
         .extensions
         .values()
-        .map(|entry| {
-            let installed = chrome.extensions.get(&entry.id);
-            let status = if let Some(problem) = &entry.problem {
-                if problem.starts_with("Local files have changed")
-                    || problem.starts_with("Local files already exist")
-                {
-                    ExtensionStatus::LocallyModified
-                } else {
-                    ExtensionStatus::Error
-                }
-            } else if !entry.available {
-                ExtensionStatus::Unavailable
-            } else if installed.is_some() && entry.pending_version.is_some() {
-                ExtensionStatus::UpdateReady
-            } else if installed.is_some() {
-                ExtensionStatus::Installed
-            } else {
-                ExtensionStatus::ReadyToInstall
-            };
-            let icon_path = entry.icon_relative_path.as_ref().and_then(|relative| {
-                let path = paths.extension_dir(&entry.id).join(relative);
-                path.exists().then(|| path.to_string_lossy().to_string())
-            });
-            ExtensionView {
-                id: entry.id.clone(),
-                name: entry.name.clone(),
-                description: entry.description.clone(),
-                local_version: entry.active_version.clone(),
-                installed_version: installed.map(|record| record.version.clone()),
-                available_version: entry.pending_version.clone().or_else(|| {
-                    Some(entry.remote_version.clone()).filter(|value| !value.is_empty())
-                }),
-                icon_path,
-                status,
-                problem: entry.problem.clone(),
-            }
+        .map(|entry| ExtensionView {
+            id: entry.id.clone(),
+            name: entry.name.clone(),
+            description: entry.description.clone(),
+            local_version: None,
+            installed_version: None,
+            available_version: (!entry.remote_version.is_empty())
+                .then(|| entry.remote_version.clone()),
+            icon_path: None,
+            status: ExtensionStatus::NotInstalled,
+            problem: entry.problem.clone(),
+            download_state: "notDownloaded".into(),
+            downloaded_version: None,
+            installations: Vec::new(),
+            requires_overwrite_confirmation: false,
+            overwrite_path: None,
         })
         .collect();
-    extensions.sort_by(|left, right| {
-        left.name
+    extensions.sort_by(|a, b| {
+        a.name
             .to_lowercase()
-            .cmp(&right.name.to_lowercase())
-            .then_with(|| left.id.cmp(&right.id))
+            .cmp(&b.name.to_lowercase())
+            .then_with(|| a.id.cmp(&b.id))
     });
     ManagerSnapshot {
         extensions,
         last_synced_at: state.last_synced_at.clone(),
-        repository_url: repository_url.to_string(),
+        repository_url: repository_url.into(),
+        profiles: Vec::new(),
+        selected_profile: "Default".into(),
+        detection_error: None,
     }
 }
 
@@ -651,10 +460,8 @@ fn validate_manifest(id: &str, manifest: &ChromeManifest) -> Result<(), String> 
     if manifest.manifest_version != 3 {
         return Err(format!("{id} must use Manifest V3"));
     }
-    if manifest.name.trim().is_empty() || manifest.name.starts_with("__MSG_") {
-        return Err(format!(
-            "{id} must use a non-localized manifest name in the MVP"
-        ));
+    if manifest.name.trim().is_empty() {
+        return Err(format!("{id} must have a non-empty manifest name"));
     }
     parse_version(&manifest.version)?;
     if let Some(icon) = manifest.preferred_icon() {
@@ -715,49 +522,13 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(digest.finalize())
 }
 
-fn local_files_changed(paths: &StoragePaths, entry: &ManagedExtension) -> Result<bool, String> {
-    let directory = paths.extension_dir(&entry.id);
-    if !directory.exists() {
-        // A deleted directory can be downloaded again without overwriting edits.
-        return Ok(false);
-    }
-    if entry.active_hashes.is_empty() {
-        return Ok(true);
-    }
-    Ok(hash_directory(&directory)? != entry.active_hashes)
-}
-
-fn copy_directory(source: &Path, destination: &Path) -> Result<(), String> {
+pub fn copy_directory(source: &Path, destination: &Path) -> Result<(), String> {
     for relative in hash_directory(source)?.keys() {
         let target = destination.join(safe_relative_path(relative)?);
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
         fs::copy(source.join(relative), target).map_err(|error| error.to_string())?;
-    }
-    Ok(())
-}
-
-fn refresh_local_integrity(
-    paths: &StoragePaths,
-    state: &mut RepositoryState,
-    target: Option<&str>,
-) -> Result<(), String> {
-    for entry in state.extensions.values_mut() {
-        if target.is_some_and(|id| id != entry.id) {
-            continue;
-        }
-        let changed = local_files_changed(paths, entry)?;
-        if changed {
-            entry.problem =
-                Some("Local files have changed since the last NoX download; update blocked".into());
-        } else if entry
-            .problem
-            .as_deref()
-            .is_some_and(|problem| problem.starts_with("Local files have changed"))
-        {
-            entry.problem = None;
-        }
     }
     Ok(())
 }

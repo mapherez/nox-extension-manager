@@ -59,6 +59,130 @@ fn read_settings(profile: &Path) -> Result<BTreeMap<String, Value>, String> {
     Ok(settings)
 }
 
+pub fn profiles() -> Result<Vec<crate::model::ChromeProfile>, String> {
+    #[cfg(target_os = "windows")]
+    let root = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .ok_or("Chrome user data directory could not be resolved")?
+        .join(r"Google\Chrome\User Data");
+    #[cfg(target_os = "macos")]
+    let root = dirs::home_dir()
+        .ok_or("Home directory could not be resolved")?
+        .join("Library/Application Support/Google/Chrome");
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let root = dirs::home_dir()
+        .ok_or("Home directory could not be resolved")?
+        .join(".config/google-chrome");
+    let local: Value = match fs::read(root.join("Local State")) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|e| format!("Invalid Chrome Local State: {e}"))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Value::Null,
+        Err(e) => return Err(format!("Could not read Chrome profiles: {e}")),
+    };
+    let mut ids = std::collections::BTreeSet::from(["Default".to_string()]);
+    if let Some(cache) = local
+        .pointer("/profile/info_cache")
+        .and_then(Value::as_object)
+    {
+        ids.extend(cache.keys().cloned());
+    }
+    if root.is_dir() {
+        for entry in fs::read_dir(&root).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let id = entry.file_name().to_string_lossy().to_string();
+            if id == "System Profile" || id == "Guest Profile" {
+                continue;
+            }
+            if entry.path().join("Preferences").is_file()
+                || entry.path().join("Secure Preferences").is_file()
+            {
+                ids.insert(id);
+            }
+        }
+    }
+    let mut profiles = Vec::new();
+    for id in ids {
+        if !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == ' ' || c == '_' || c == '-')
+        {
+            continue;
+        }
+        let name = local
+            .pointer("/profile/info_cache")
+            .and_then(|v| v.get(&id))
+            .and_then(|v| v.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or(&id)
+            .to_string();
+        profiles.push(crate::model::ChromeProfile {
+            path: root.join(&id).to_string_lossy().to_string(),
+            id,
+            name,
+        });
+    }
+    Ok(profiles)
+}
+
+pub fn inventory(profile: &Path) -> Result<Vec<crate::model::ChromeInstallation>, String> {
+    let mut installed = Vec::new();
+    for (id, entry) in read_settings(profile)? {
+        if !valid_id(&id) {
+            continue;
+        }
+        let location = entry
+            .get("location")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        // Component extensions are Chrome's own implementation, not user installations.
+        if !matches!(location, 1 | 2 | 3 | 4 | 6 | 7 | 8 | 9 | 10) {
+            continue;
+        }
+        let Some(value) = entry.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        let relative = Path::new(value);
+        let path = if relative.is_absolute() {
+            relative.to_path_buf()
+        } else {
+            if relative
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+            {
+                return Err(format!("Chrome returned an unsafe extension path for {id}"));
+            }
+            profile.join("Extensions").join(relative)
+        };
+        let manifest_path = path.join("manifest.json");
+        let bytes = fs::read(&manifest_path).map_err(|e| {
+            format!(
+                "Could not read installed manifest {}: {e}",
+                manifest_path.display()
+            )
+        })?;
+        let manifest: crate::model::ChromeManifest =
+            serde_json::from_slice(&bytes).map_err(|e| {
+                format!(
+                    "Invalid installed manifest {}: {e}",
+                    manifest_path.display()
+                )
+            })?;
+        crate::repository::compare_versions(&manifest.version, &manifest.version)?;
+        installed.push(crate::model::ChromeInstallation {
+            chrome_extension_id: id,
+            path: path.to_string_lossy().to_string(),
+            name: manifest.name,
+            version: manifest.version,
+            unpacked: location == 4,
+        });
+    }
+    Ok(installed)
+}
+
+pub fn same_path(left: &Path, right: &Path) -> bool {
+    normalized_path(left) == normalized_path(right)
+}
+
 pub fn verify(profile: &Path, extension_path: &Path, expected_id: &str) -> Result<(), String> {
     let actual = registered_id(profile, extension_path)?;
     if actual.as_deref() != Some(expected_id) {

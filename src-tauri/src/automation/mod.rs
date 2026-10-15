@@ -1,6 +1,12 @@
 use std::path::Path;
 
 pub trait BrowserAutomationBackend: Send + Sync {
+    fn for_profile(
+        &self,
+        _: &crate::model::ChromeProfile,
+    ) -> Result<std::sync::Arc<dyn BrowserAutomationBackend>, String> {
+        Err("Chrome automation is unavailable for this profile".into())
+    }
     fn preflight(&self) -> Result<(), String>;
     fn registered_id(&self, extension_path: &Path) -> Result<Option<String>, String>;
     fn install(&self, extension_path: &Path, expected_version: &str) -> Result<String, String>;
@@ -18,8 +24,7 @@ pub trait BrowserAutomationBackend: Send + Sync {
     fn remove(&self, extension_path: &Path, chrome_extension_id: &str) -> Result<(), String>;
 }
 
-#[cfg(any(target_os = "windows", target_os = "macos", test))]
-mod registration;
+pub mod registration;
 
 #[cfg(target_os = "windows")]
 mod windows;

@@ -231,6 +231,14 @@ h1 { margin: 0; font-size: clamp(30px, 3.2vw, 40px); line-height: 1; letter-spac
 .card-actions { display: flex; justify-content: flex-end; gap: 10px; min-width: 250px; }
 .card-actions .button { min-width: 116px; }
 
+.profile-picker, .installation-picker { display: grid; gap: 6px; color: var(--muted); font-size: 12px; }
+.profile-picker select, .installation-picker select { max-width: 100%; padding: 9px; border: 1px solid #3a506d; border-radius: 8px; color: #dce7f8; background: #101c2c; }
+.installation-picker { margin-top: 10px; }
+.installation-path { display: block; overflow: hidden; margin-top: 7px; color: #8296b4; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.native-dialog { color: #dce7f8; max-height: 90vh; overflow: auto; }
+.native-dialog::backdrop { background: rgba(2, 7, 14, .75); backdrop-filter: blur(5px); }
+.dialog .confirmation-target { margin-top: 15px; overflow-wrap: anywhere; font-size: 13px; }
+
 .empty-state {
   display: grid;
   place-items: center;

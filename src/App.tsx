@@ -4,16 +4,17 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import {
   AlertTriangle, Check, CheckCircle2, Circle, Download, GitFork, Minus, Package,
-  RefreshCw, RotateCcw, Search, Square, Trash2, X,
+  RefreshCw, Search, Square, Trash2, X,
 } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import './App.css';
-import { localIconUrl } from './services/managerApi';
+import { localIconUrl, prepareInstallation } from './services/managerApi';
 import { useAppUpdaterStore, type AppUpdaterStatus } from './store/useAppUpdaterStore';
 import { useManagerStore } from './store/useManagerStore';
-import type { ExtensionAction, ExtensionStatus, ExtensionView } from './types';
+import type { ActionOptions, ActionTarget, ChromeInstallation, ExtensionAction, ExtensionStatus, ExtensionView, OverwriteConsent } from './types';
 
 const statusCopy: Record<ExtensionStatus, string> = {
+  notInstalled: 'Not installed', ambiguous: 'Choose installation', detectionUnavailable: 'Detection unavailable',
   downloading: 'Downloading',
   readyToInstall: 'Ready to install', installed: 'Installed', updateReady: 'Update ready',
   locallyModified: 'Locally modified', unavailable: 'Unavailable', error: 'Error',
@@ -25,10 +26,12 @@ function App() {
   const syncing = useManagerStore((state) => state.syncing);
   const syncError = useManagerStore((state) => state.syncError);
   const activeExtensionId = useManagerStore((state) => state.activeExtensionId);
+  const activeAction = useManagerStore((state) => state.activeAction);
+  const selectProfile = useManagerStore((state) => state.selectProfile);
   const error = useManagerStore((state) => state.error);
   const notice = useManagerStore((state) => state.notice);
-  const retryOperation = useManagerStore((state) => state.retryOperation);
-  const retryExtensionId = retryOperation && 'id' in retryOperation ? retryOperation.id : null;
+
+
   const initialize = useManagerStore((state) => state.initialize);
   const sync = useManagerStore((state) => state.sync);
   const runAction = useManagerStore((state) => state.runAction);
@@ -37,7 +40,10 @@ function App() {
   const clearNotice = useManagerStore((state) => state.clearNotice);
   const checkAppUpdate = useAppUpdaterStore((state) => state.check);
   const [query, setQuery] = useState('');
-  const [confirmTarget, setConfirmTarget] = useState<{ extension: ExtensionView; action: 'remove' | 'repair' } | null>(null);
+  const [confirmTarget, setConfirmTarget] = useState<{
+    extension: ExtensionView; action: 'remove' | 'install' | 'update'; options: ActionOptions;
+  } | null>(null);
+  const [preparing, setPreparing] = useState(false);
 
   useEffect(() => { void initialize(); void checkAppUpdate(true); }, [checkAppUpdate, initialize]);
   useEffect(() => {
@@ -53,13 +59,22 @@ function App() {
       `${extension.name} ${extension.description} ${extension.id}`.toLowerCase().includes(normalized));
   }, [query, snapshot?.extensions]);
 
-  const act = (action: ExtensionAction, id: string) => {
-    if (action === 'repair') {
-      const extension = snapshot?.extensions.find((entry) => entry.id === id);
-      if (extension) setConfirmTarget({ extension, action });
+  const act = async (action: ExtensionAction, id: string, target?: ActionTarget) => {
+    const extension = snapshot?.extensions.find((entry) => entry.id === id);
+    if (!extension || preparing) return;
+    if (action === 'remove') { setConfirmTarget({ extension, action, options: { target } }); return; }
+    if (action === 'install' || action === 'update') {
+      setPreparing(true);
+      try {
+        const consent = await prepareInstallation(id, target);
+        if (consent) { setConfirmTarget({ extension, action, options: { target, consent } }); return; }
+        await runAction(action, id, { target });
+      } catch (error) {
+        useManagerStore.setState({ error: error instanceof Error ? error.message : String(error), retryOperation: null });
+      } finally { setPreparing(false); }
       return;
     }
-    void runAction(action, id);
+    await runAction(action, id);
   };
 
   return (
@@ -70,7 +85,15 @@ function App() {
         <header className="page-header">
           <div><p className="eyebrow">LOCAL CHROME LIBRARY</p><h1>Extensions</h1></div>
           <div className="sync-cluster">
-            <button className="button button-secondary sync-button" onClick={() => void sync()} disabled={syncing || Boolean(activeExtensionId)}>
+            <label className="profile-picker">Chrome profile
+              <select aria-label="Chrome profile" value={snapshot?.selectedProfile ?? 'Default'}
+                disabled={syncing || preparing || Boolean(activeExtensionId)}
+                onChange={(event) => void selectProfile(event.currentTarget.value)}>
+                {(snapshot?.profiles?.length ? snapshot.profiles : [{ id: 'Default', name: 'Default' }]).map((profile) =>
+                  <option key={profile.id} value={profile.id}>{profile.name} ({profile.id})</option>)}
+              </select>
+            </label>
+            <button className="button button-secondary sync-button" onClick={() => void sync()} disabled={preparing || syncing || Boolean(activeExtensionId)}>
               <RefreshCw size={19} className={syncing ? 'spin' : undefined} />
               {syncing ? 'Syncing…' : 'Sync extensions'}
             </button>
@@ -79,6 +102,7 @@ function App() {
             </span>
           </div>
         </header>
+        {snapshot?.detectionError ? <p className="problem-copy" role="alert">Chrome detection failed: {snapshot.detectionError}</p> : null}
         <label className="search-box">
           <Search size={23} aria-hidden="true" />
           <input type="search" value={query} onChange={(event) => setQuery(event.currentTarget.value)}
@@ -92,21 +116,18 @@ function App() {
               <span>{query ? 'Try a different search.' : 'Sync the repository to look for extensions.'}</span>
             </div>) : null}
           {filtered.map((extension, index) => (
-            <ExtensionCard key={extension.id} extension={extension} index={index}
-              busy={activeExtensionId === extension.id} downloading={syncing}
-              disabled={syncing || Boolean(activeExtensionId && activeExtensionId !== extension.id)}
-              onAction={act} onRemove={() => setConfirmTarget({ extension, action: 'remove' })} />
+            <ExtensionCard key={`${snapshot?.selectedProfile}:${extension.id}`} extension={extension} index={index}
+              busy={activeExtensionId === extension.id} downloading={activeExtensionId === extension.id && activeAction === 'download'}
+              profileId={snapshot?.selectedProfile ?? 'Default'}
+              disabled={preparing || syncing || Boolean(activeExtensionId && activeExtensionId !== extension.id)}
+              onAction={(action, id, target) => void act(action, id, target)} onRemove={(target) => void act('remove', extension.id, target)} />
           ))}
         </section>
       </main>
       <AppFooter />
-      {confirmTarget ? <ConfirmDialog extension={confirmTarget.extension} action={confirmTarget.action} onCancel={() => setConfirmTarget(null)}
-        onConfirm={() => { void runAction(confirmTarget.action, confirmTarget.extension.id); setConfirmTarget(null); }} /> : null}
+      {confirmTarget ? <ConfirmDialog extension={confirmTarget.extension} action={confirmTarget.action} target={confirmTarget.options.target} consent={confirmTarget.options.consent} onCancel={() => setConfirmTarget(null)}
+        onConfirm={() => { void runAction(confirmTarget.action, confirmTarget.extension.id, confirmTarget.options); setConfirmTarget(null); }} /> : null}
       {error ? <ErrorDialog message={error} repositoryUrl={snapshot?.repositoryUrl}
-        repairId={retryExtensionId
-          && snapshot?.extensions.some((entry) => entry.id === retryExtensionId && entry.status === 'locallyModified')
-          ? retryExtensionId : null}
-        onRepair={(id) => { clearError(); act('repair', id); }}
         onClose={clearError} onRetry={() => void retry()} /> : null}
       {notice ? <div className="toast"><CheckCircle2 size={18} />{notice}</div> : null}
     </div>
@@ -129,30 +150,61 @@ function Titlebar() {
 }
 
 type CardProps = { extension: ExtensionView; index: number; busy: boolean; downloading: boolean; disabled: boolean;
-  onAction: (action: ExtensionAction, id: string) => void; onRemove: () => void };
+  profileId?: string; onAction: (action: ExtensionAction, id: string, target?: ActionTarget) => void;
+  onRemove: (target?: ActionTarget) => void };
 
-export function ExtensionCard({ extension, index, busy, downloading, disabled, onAction, onRemove }: CardProps) {
+function versionAhead(remote: string, installed: string) {
+  const left = remote.split('.').map(Number), right = installed.split('.').map(Number);
+  for (let i = 0; i < 4; i++) { if ((left[i] ?? 0) !== (right[i] ?? 0)) return (left[i] ?? 0) > (right[i] ?? 0); }
+  return false;
+}
+
+export function ExtensionCard({ extension, index, busy, downloading, disabled, profileId = 'Default', onAction, onRemove }: CardProps) {
+  const [selectedId, setSelectedId] = useState('');
+  const installations = extension.installations ?? [];
+  const installation: ChromeInstallation | undefined = installations.length === 1 ? installations[0]
+    : installations.find((item) => item.chromeExtensionId === selectedId);
+  const target: ActionTarget | undefined = installation ? { profileId, chromeExtensionId: installation.chromeExtensionId,
+    path: installation.path, version: installation.version } : undefined;
   const iconUrl = localIconUrl(extension.iconPath);
-  const installed = Boolean(extension.installedVersion);
-  const displayStatus: ExtensionStatus = downloading ? 'downloading' : extension.status;
-  return <article className={`extension-card status-${displayStatus}`}>
+  const needsUpdate = installation && extension.availableVersion
+    ? versionAhead(extension.availableVersion, installation.version) : extension.status === 'updateReady';
+  const blocked = ['error', 'unavailable', 'detectionUnavailable'].includes(extension.status)
+    || (installations.length > 1 && !installation) || Boolean(installation && !installation.unpacked);
+  const actionable = !blocked && (!installation || needsUpdate);
+  const downloaded = extension.downloadState === 'downloaded';
+  const displayStatus: ExtensionStatus = downloading ? 'downloading'
+    : extension.status === 'ambiguous' && installation ? (needsUpdate ? 'updateReady' : 'installed') : extension.status;
+  const action: ExtensionAction = downloaded ? (installation ? 'update' : 'install') : 'download';
+  return <article className={`extension-card status-${displayStatus}`} aria-busy={busy}>
     <div className={`extension-icon extension-icon-${index % 4}`}>
       {iconUrl ? <img src={iconUrl} alt="" /> : <Package size={35} />}
     </div>
     <div className="extension-copy"><h2>{extension.name}</h2>
-      <p>{extension.description || 'Chrome extension'}</p><VersionLine extension={extension} />
+      <p>{extension.description || 'Chrome extension'}</p>
+      <VersionLine extension={{ ...extension, installedVersion: installation?.version ?? extension.installedVersion }} />
+      {installations.length > 1 ? <label className="installation-picker">Chrome installation
+        <select aria-label={`Installation for ${extension.name}`} value={selectedId} disabled={busy || disabled}
+          onChange={(event) => setSelectedId(event.currentTarget.value)}>
+          <option value="">Choose an installation</option>
+          {installations.map((item) => <option key={item.chromeExtensionId} value={item.chromeExtensionId}>
+            {item.chromeExtensionId} · v{item.version} · {item.path}
+          </option>)}
+        </select></label> : null}
+      {installation ? <span className="installation-path" title={installation.path}>{installation.path}</span> : null}
+      {installation && !installation.unpacked ? <span className="problem-copy">Managed by Chrome; use Chrome to change this installation.</span> : null}
       {extension.problem ? <span className="problem-copy">{extension.problem}</span> : null}
+      {downloaded && actionable ? <span className="version-copy">Downloaded v{extension.downloadedVersion} · Ready to install</span> : null}
     </div>
     <div className={`status-pill pill-${displayStatus}`}><StatusIcon status={displayStatus} />{statusCopy[displayStatus]}</div>
     <div className="card-actions">
-      {extension.status === 'locallyModified' ? <button className="button button-secondary"
-        disabled={busy || disabled} aria-label={`Restore repository files for ${extension.name}`}
-        onClick={() => onAction('repair', extension.id)}><RotateCcw size={18} /> Restore files</button> : null}
-      {extension.status === 'readyToInstall' ? <button className="button button-primary" disabled={busy || disabled}
-        onClick={() => onAction('install', extension.id)}>{busy ? <RefreshCw className="spin" size={18} /> : <Download size={18} />} Install</button> : null}
-      {extension.status === 'updateReady' ? <button className="button button-primary" disabled={busy || disabled}
-        onClick={() => onAction('update', extension.id)}>{busy ? <RefreshCw className="spin" size={18} /> : <RefreshCw size={18} />} Update</button> : null}
-      {installed ? <button className="button button-danger" disabled={busy || disabled} onClick={onRemove}>
+      {actionable ? <button className="button button-primary" disabled={busy || disabled}
+        onClick={() => onAction(action, extension.id, target)}>
+        {busy ? <RefreshCw className="spin" size={18} /> : <Download size={18} />}
+        {busy ? (downloading ? 'Downloading…' : 'Installing…') : downloaded
+          ? (installation ? 'Install update' : 'Install') : (installation ? 'Download update' : 'Download')}
+      </button> : null}
+      {installation ? <button className="button button-danger" disabled={busy || disabled || blocked} onClick={() => onRemove(target)}>
         <Trash2 size={18} /> Remove</button> : null}
     </div>
   </article>;
@@ -215,74 +267,45 @@ function AppFooter() {
   </footer>;
 }
 
-export function ConfirmDialog({ extension, action, onCancel, onConfirm }: { extension: ExtensionView; action: 'remove' | 'repair'; onCancel: () => void; onConfirm: () => void }) {
-  const repair = action === 'repair';
+export function ConfirmDialog({ extension, action, target, consent, onCancel, onConfirm }: {
+  extension: ExtensionView; action: 'remove' | 'repair' | 'install' | 'update'; target?: ActionTarget;
+  consent?: OverwriteConsent; onCancel: () => void; onConfirm: () => void;
+}) {
   const cancelButton = useRef<HTMLButtonElement>(null);
-  useEffect(() => {
-    cancelButton.current?.focus();
-    const handleKey = (event: KeyboardEvent) => event.key === 'Escape' && onCancel();
-    window.addEventListener('keydown', handleKey);
-    return () => window.removeEventListener('keydown', handleKey);
-  }, [onCancel]);
-  return <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onCancel()}>
-    <section className="dialog" role="alertdialog" aria-modal="true" aria-labelledby="remove-title">
-      <div className="dialog-icon danger">{repair ? <RotateCcw size={22} /> : <Trash2 size={22} />}</div>
-      <h2 id="remove-title">{repair ? `Restore repository files for ${extension.name}?` : `Remove ${extension.name} from Chrome?`}</h2>
-      <p>{repair ? 'The repository version will replace this extension’s local files. A backup of the current files will be kept in .nox/backups. Only this extension will be reconnected in Chrome.' : 'The local files will stay in Documents, ready to install again.'}</p>
-      <div className="dialog-actions"><button ref={cancelButton} className="button button-secondary" onClick={onCancel}>Cancel</button>
-        <button className="button button-danger-solid" onClick={onConfirm}>{repair ? 'Restore files' : 'Remove'}</button></div>
-    </section></div>;
+  const dialog = useRef<HTMLDialogElement>(null);
+  const removing = action === 'remove';
+  useEffect(() => { dialog.current?.showModal(); cancelButton.current?.focus(); }, []);
+  return <dialog ref={dialog} className="dialog native-dialog" aria-labelledby="confirm-title"
+    onCancel={(event) => { event.preventDefault(); onCancel(); }}>
+    <div className="dialog-icon danger"><AlertTriangle size={22} /></div>
+    <h2 id="confirm-title">{removing ? `Remove ${extension.name} from Chrome?` : `Replace files for ${extension.name}?`}</h2>
+    <p>{removing ? 'Chrome will uninstall this exact extension and may delete its extension data. The extension files on disk will be kept.'
+      : 'These files have no matching trusted baseline or contain local changes. They will be replaced only after a backup is created beside this folder.'}</p>
+    <p className="confirmation-target">
+      Profile: {target?.profileId ?? consent?.profileId ?? 'Default'}<br />
+      {target ? <>Chrome ID: {target.chromeExtensionId}<br />Version: {target.version}<br /></> : null}
+      Folder: {consent?.path ?? target?.path ?? extension.overwritePath}
+    </p>
+    <div className="dialog-actions"><button ref={cancelButton} className="button button-secondary" onClick={onCancel}>Cancel</button>
+      <button className="button button-danger-solid" onClick={onConfirm}>{removing ? 'Remove' : 'Back up and install'}</button></div>
+  </dialog>;
 }
 
-function ErrorDialog({ message, repositoryUrl, repairId, onClose, onRetry, onRepair }: {
-  message: string; repositoryUrl?: string; repairId: string | null; onClose: () => void;
-  onRetry: () => void; onRepair: (id: string) => void;
+function ErrorDialog({ message, repositoryUrl, onClose, onRetry }: {
+  message: string; repositoryUrl?: string; onClose: () => void; onRetry: () => void;
 }) {
-  return (
-    <div className="dialog-backdrop">
-      <section
-        className="dialog"
-        role="alertdialog"
-        aria-modal="true"
-        aria-labelledby="error-title"
-      >
-        <div className="dialog-icon warning">
-          <AlertTriangle size={23} />
-        </div>
-        <h2 id="error-title">NoX could not complete the action</h2>
-        <p>{message}</p>
-        <div className="dialog-actions dialog-actions-spread">
-          <button
-            className="button button-ghost"
-            onClick={() =>
-              void openUrl(
-                repositoryUrl ??
-                  "https://github.com/mapherez/nox-extension-manager",
-              )
-            }
-          >
-            <GitFork size={17} /> Open GitHub
-          </button>
-          <div>
-            <button className="button button-secondary" onClick={onClose}>
-              Close
-            </button>
-            {repairId ? (
-              <button
-                className="button button-secondary"
-                onClick={() => onRepair(repairId)}
-              >
-                <RotateCcw size={17} /> Restore files
-              </button>
-            ) : null}
-            <button className="button button-primary" onClick={onRetry}>
-              Retry
-            </button>
-          </div>
-        </div>
-      </section>
+  const dialog = useRef<HTMLDialogElement>(null);
+  useEffect(() => { dialog.current?.showModal(); }, []);
+  return <dialog ref={dialog} className="dialog native-dialog" aria-labelledby="error-title"
+    onCancel={(event) => { event.preventDefault(); onClose(); }}>
+    <div className="dialog-icon warning"><AlertTriangle size={23} /></div>
+    <h2 id="error-title">NoX could not complete the action</h2><p>{message}</p>
+    <div className="dialog-actions dialog-actions-spread">
+      <button className="button button-ghost" onClick={() => void openUrl(repositoryUrl ?? "https://github.com/mapherez/nox-extension-manager")}><GitFork size={17} /> Open GitHub</button>
+      <div><button className="button button-secondary" onClick={onClose}>Close</button>
+        <button className="button button-primary" onClick={onRetry}>Retry</button></div>
     </div>
-  );
+  </dialog>;
 }
 
 function LoadingCards() { return <>{[0, 1, 2].map((item) => <div className="extension-card skeleton" key={item} />)}</>; }

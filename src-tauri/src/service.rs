@@ -1,16 +1,14 @@
-use std::collections::BTreeSet;
-use std::fs;
-use std::sync::Arc;
-
-use chrono::Utc;
-
-use crate::automation::BrowserAutomationBackend;
-use crate::model::{
-    ChromeInstallRecord, ChromeManifest, ChromeState, ExtensionActionResult, ManagedExtension,
-    ManagerSnapshot, RepositoryConfig, RepositoryState,
+use crate::automation::{registration, BrowserAutomationBackend};
+use crate::model::*;
+use crate::repository::{
+    build_snapshot, compare_versions, copy_directory, hash_directory, RepositoryClient,
 };
-use crate::repository::{build_snapshot, compare_versions, hash_directory, RepositoryClient};
 use crate::storage::StoragePaths;
+use chrono::Utc;
+use std::cmp::Ordering;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub struct ManagerService {
     paths: StoragePaths,
@@ -20,389 +18,475 @@ pub struct ManagerService {
 
 impl ManagerService {
     pub fn new(automation: Arc<dyn BrowserAutomationBackend>) -> Result<Self, String> {
-        let config: RepositoryConfig = serde_json::from_str(include_str!(
-            "../resources/repository.json"
-        ))
-        .map_err(|error| format!("Embedded repository configuration is invalid: {error}"))?;
+        let config = serde_json::from_str(include_str!("../resources/repository.json"))
+            .map_err(|e| format!("Invalid repository configuration: {e}"))?;
         let paths = StoragePaths::discover()?;
         paths.ensure()?;
-        let repository = RepositoryClient::new(config)?;
         Ok(Self {
             paths,
-            repository,
+            repository: RepositoryClient::new(config)?,
             automation,
         })
     }
 
+    fn profile(&self) -> Result<(Vec<ChromeProfile>, ChromeProfile), String> {
+        let profiles = registration::profiles()?;
+        let selected = self
+            .paths
+            .preferences()
+            .unwrap_or_default()
+            .profile
+            .unwrap_or_else(|| "Default".into());
+        let profile = profiles
+            .iter()
+            .find(|p| p.id == selected)
+            .ok_or_else(|| {
+                format!("Chrome profile {selected} is unavailable; select another profile")
+            })?
+            .clone();
+        Ok((profiles, profile))
+    }
+
+    pub fn select_profile(&self, id: &str) -> Result<ManagerSnapshot, String> {
+        if !registration::profiles()?.iter().any(|p| p.id == id) {
+            return Err("Unknown Chrome profile".into());
+        }
+        self.paths.save_preferences(&ManagerPreferences {
+            profile: Some(id.into()),
+        })?;
+        self.snapshot()
+    }
+
     pub fn snapshot(&self) -> Result<ManagerSnapshot, String> {
-        let mut repository = self.paths.load_repository_state()?;
-        self.refresh_local_manifests(&mut repository)?;
-        self.paths.save_repository_state(&repository)?;
-        let chrome = self.chrome_state(&repository)?;
-        Ok(build_snapshot(
+        let state = self.paths.load_repository_state()?;
+        let mut snapshot = build_snapshot(
             &self.paths,
-            &repository,
-            &chrome,
+            &state,
+            &ChromeState::default(),
             self.repository.repository_url(),
-        ))
+        );
+        let inventory = match self.profile() {
+            Ok((profiles, profile)) => {
+                snapshot.profiles = profiles;
+                snapshot.selected_profile = profile.id;
+                registration::inventory(Path::new(&profile.path))
+            }
+            Err(error) => {
+                snapshot.profiles = registration::profiles().unwrap_or_default();
+                snapshot.selected_profile = self
+                    .paths
+                    .preferences()
+                    .unwrap_or_default()
+                    .profile
+                    .unwrap_or_else(|| "Default".into());
+                Err(error)
+            }
+        };
+        let installations = match inventory {
+            Ok(items) => items,
+            Err(error) => {
+                snapshot.detection_error = Some(error);
+                Vec::new()
+            }
+        };
+        for view in &mut snapshot.extensions {
+            let entry = &state.extensions[&view.id];
+            view.installations = installations
+                .iter()
+                .filter(|item| item.name == entry.name)
+                .cloned()
+                .collect();
+            let installed = (view.installations.len() == 1).then(|| &view.installations[0]);
+            view.installed_version = installed.map(|i| i.version.clone());
+            view.local_version = None;
+            view.downloaded_version = None;
+            view.download_state = "notDownloaded".into();
+            // Validate saved payloads before exposing an Install action.
+            if let Some(version) = &entry.pending_version {
+                let pending = self.paths.pending_dir(&entry.id, version);
+                if compare_versions(version, &entry.remote_version)
+                    .is_ok_and(|o| o == Ordering::Equal)
+                    && !entry.pending_hashes.is_empty()
+                    && hash_directory(&pending).is_ok_and(|h| h == entry.pending_hashes)
+                {
+                    view.downloaded_version = Some(version.clone());
+                    view.download_state = "downloaded".into();
+                }
+            }
+            view.overwrite_path = installed.map(|i| i.path.clone()).or_else(|| {
+                let path = self.paths.extension_dir(&entry.id);
+                path.exists().then(|| path.to_string_lossy().to_string())
+            });
+            view.requires_overwrite_confirmation =
+                view.overwrite_path.as_ref().is_some_and(|path| {
+                    entry.trusted_path.as_deref().is_none_or(|trusted| {
+                        !registration::same_path(Path::new(trusted), Path::new(path))
+                    }) || entry.active_hashes.is_empty()
+                });
+            view.status = if snapshot.detection_error.is_some() {
+                ExtensionStatus::DetectionUnavailable
+            } else if entry.problem.is_some() {
+                ExtensionStatus::Error
+            } else if !entry.available {
+                ExtensionStatus::Unavailable
+            } else if view.installations.len() > 1 {
+                ExtensionStatus::Ambiguous
+            } else if let Some(installed) = installed {
+                if compare_versions(&entry.remote_version, &installed.version)? == Ordering::Greater
+                {
+                    ExtensionStatus::UpdateReady
+                } else {
+                    ExtensionStatus::Installed
+                }
+            } else {
+                ExtensionStatus::NotInstalled
+            };
+            view.icon_path = installed.and_then(|i| {
+                let manifest: ChromeManifest = serde_json::from_slice(
+                    &fs::read(Path::new(&i.path).join("manifest.json")).ok()?,
+                )
+                .ok()?;
+                let relative = manifest.preferred_icon()?;
+                if Path::new(&relative)
+                    .components()
+                    .any(|c| !matches!(c, std::path::Component::Normal(_)))
+                {
+                    return None;
+                }
+                let path = Path::new(&i.path).join(relative);
+                path.is_file().then(|| path.to_string_lossy().to_string())
+            });
+        }
+        Ok(snapshot)
     }
 
     pub async fn sync(&mut self) -> Result<ManagerSnapshot, String> {
-        let mut repository = self.paths.load_repository_state()?;
-        self.refresh_local_manifests(&mut repository)?;
-        let chrome = self.chrome_state(&repository)?;
-        self.paths.log("Extension synchronization started");
+        let mut state = self.paths.load_repository_state()?;
         self.repository
-            .sync(&self.paths, &mut repository, &chrome)
-            .await
-            .map_err(|error| {
-                self.paths
-                    .log(&format!("Extension synchronization failed: {error}"));
-                error
-            })?;
-        self.paths.log("Extension synchronization completed");
-        let chrome = self.chrome_state(&repository)?;
-        Ok(build_snapshot(
-            &self.paths,
-            &repository,
-            &chrome,
-            self.repository.repository_url(),
-        ))
+            .sync(&self.paths, &mut state, &ChromeState::default())
+            .await?;
+        self.snapshot()
     }
 
-    pub async fn install(&mut self, id: &str) -> Result<ExtensionActionResult, String> {
-        let mut repository = self.paths.load_repository_state()?;
-        self.refresh_local_manifests(&mut repository)?;
-        let mut chrome = self.chrome_state(&repository)?;
-        if chrome.extensions.contains_key(id) {
-            return self.result(
-                "This extension is already installed in Chrome",
-                &repository,
-                &chrome,
-            );
-        }
-        let extension = repository
-            .extensions
-            .get(id)
-            .ok_or_else(|| format!("Unknown extension: {id}"))?;
-        ensure_actionable(extension.problem.as_deref())?;
-        let version = extension
-            .active_version
-            .clone()
-            .ok_or_else(|| format!("{id} has not been downloaded yet"))?;
-        let path = self.paths.extension_dir(id);
-        let automation = Arc::clone(&self.automation);
-        let action_version = version.clone();
-        let chrome_id = tauri::async_runtime::spawn_blocking(move || {
-            let chrome_id = automation.install(&path, &action_version)?;
-            automation.verify_identity(&path, &chrome_id)?;
-            Ok::<_, String>(chrome_id)
-        })
-        .await
-        .map_err(|error| format!("Chrome automation task failed: {error}"))??;
-        chrome.extensions.insert(
-            id.to_string(),
-            ChromeInstallRecord {
-                chrome_extension_id: chrome_id,
-                version,
-                installed_at: Utc::now().to_rfc3339(),
-            },
-        );
-        self.paths.save_chrome_state(&chrome)?;
-        self.paths.log(&format!("Installed extension {id}"));
-        self.result("Extension installed successfully", &repository, &chrome)
+    pub async fn download(&mut self, id: &str) -> Result<ExtensionActionResult, String> {
+        let mut state = self.paths.load_repository_state()?;
+        self.repository
+            .download(&self.paths, &mut state, id)
+            .await?;
+        self.result("Download completed. Choose Install to apply it.")
     }
 
-    pub async fn update(&mut self, id: &str) -> Result<ExtensionActionResult, String> {
-        let mut repository = self.paths.load_repository_state()?;
-        self.refresh_local_manifests(&mut repository)?;
-        let mut chrome = self.chrome_state(&repository)?;
-        let installed = chrome
+    fn resolve(
+        &self,
+        id: &str,
+        target: Option<&ActionTarget>,
+    ) -> Result<(ChromeProfile, ManagedExtension, Option<ChromeInstallation>), String> {
+        let (_, profile) = self.profile()?;
+        let state = self.paths.load_repository_state()?;
+        let entry = state
             .extensions
             .get(id)
             .cloned()
-            .ok_or_else(|| format!("{id} is not registered as installed"))?;
-        let extension = repository
-            .extensions
-            .get_mut(id)
-            .ok_or_else(|| format!("Unknown extension: {id}"))?;
-        ensure_actionable(extension.problem.as_deref())?;
-        if hash_directory(&self.paths.extension_dir(id))? != extension.active_hashes {
-            return Err("Local files have changed; update is blocked".into());
-        }
-        let pending_version = extension
-            .pending_version
-            .clone()
-            .ok_or_else(|| format!("No prepared update exists for {id}"))?;
-        let pending = self.paths.pending_dir(id, &pending_version);
-        let active = self.paths.extension_dir(id);
-        if !pending.is_dir() {
-            return Err("The prepared update directory is missing; sync again".into());
-        }
-        if hash_directory(&pending)? != extension.pending_hashes {
-            return Err("The prepared update files have changed; update is blocked".into());
-        }
-        // Validate ownership before even swapping local files. A stale NoX ID
-        // must never reload (or later remove) an unrelated Chrome extension.
-        let automation = Arc::clone(&self.automation);
-        let target = active.clone();
-        let chrome_id = installed.chrome_extension_id.clone();
-        tauri::async_runtime::spawn_blocking(move || {
-            automation.verify_identity(&target, &chrome_id)
-        })
-        .await
-        .map_err(|error| format!("Chrome automation task failed: {error}"))??;
-
-        let backup_dir = self.paths.backup_dir(id);
-        fs::create_dir_all(&backup_dir)
-            .map_err(|error| format!("Could not create the extension backup directory: {error}"))?;
-        let backup = backup_dir.join(format!(
-            "{}-{}",
-            installed.version,
-            Utc::now().timestamp_millis()
-        ));
-        fs::rename(&active, &backup)
-            .map_err(|error| format!("Could not back up the active extension: {error}"))?;
-        if let Err(error) = fs::rename(&pending, &active) {
-            let _ = fs::rename(&backup, &active);
-            return Err(format!("Could not activate the prepared update: {error}"));
-        }
-
-        let automation = Arc::clone(&self.automation);
-        let chrome_id = installed.chrome_extension_id.clone();
-        let action_version = pending_version.clone();
-        let action_path = active.clone();
-        let action = tauri::async_runtime::spawn_blocking(move || {
-            automation.reload(&action_path, &chrome_id, &action_version)
-        })
-        .await
-        .unwrap_or_else(|error| Err(format!("Chrome automation task failed: {error}")));
-        if let Err(error) = action {
-            if let Some(parent) = pending.parent() {
-                let _ = fs::create_dir_all(parent);
+            .ok_or("Unknown catalog extension; Sync first")?;
+        let items = registration::inventory(Path::new(&profile.path))?;
+        let matches: Vec<_> = items.into_iter().filter(|i| i.name == entry.name).collect();
+        if let Some(target) = target {
+            if target.profile_id != profile.id {
+                return Err("The selected profile changed; choose the installation again".into());
             }
-            let _ = fs::rename(&active, &pending);
-            let _ = fs::rename(&backup, &active);
-            let automation = Arc::clone(&self.automation);
-            let chrome_id = installed.chrome_extension_id.clone();
-            let previous_version = installed.version.clone();
-            let action_path = active.clone();
-            let _ = tauri::async_runtime::spawn_blocking(move || {
-                automation.reload(&action_path, &chrome_id, &previous_version)
-            })
-            .await;
-            self.paths
-                .log(&format!("Update rollback completed for {id}: {error}"));
+            let item = matches
+                .into_iter()
+                .find(|i| {
+                    i.chrome_extension_id == target.chrome_extension_id
+                        && registration::same_path(Path::new(&i.path), Path::new(&target.path))
+                        && i.version == target.version
+                })
+                .ok_or("The Chrome installation changed; Sync and choose it again")?;
+            if !item.unpacked {
+                return Err("This installation is managed by Chrome, not an unpacked folder; use Chrome to change it".into());
+            }
+            return Ok((profile, entry, Some(item)));
+        }
+        if !matches.is_empty() {
+            return Err("Select the exact Chrome installation before continuing".into());
+        }
+        Ok((profile, entry, None))
+    }
+
+    pub fn prepare_installation(
+        &self,
+        id: &str,
+        target: Option<&ActionTarget>,
+    ) -> Result<Option<OverwriteConsent>, String> {
+        let (profile, entry, installed) = self.resolve(id, target)?;
+        let active = installed
+            .as_ref()
+            .map(|i| PathBuf::from(&i.path))
+            .unwrap_or_else(|| self.paths.extension_dir(id));
+        if !active.exists() {
+            return Ok(None);
+        }
+        let hashes = hash_directory(&active)?;
+        let trusted = entry
+            .trusted_path
+            .as_ref()
+            .is_some_and(|p| registration::same_path(Path::new(p), &active));
+        if trusted && !entry.active_hashes.is_empty() && entry.active_hashes == hashes {
+            return Ok(None);
+        }
+        Ok(Some(OverwriteConsent {
+            profile_id: profile.id,
+            path: active.to_string_lossy().to_string(),
+            hashes,
+        }))
+    }
+
+    pub async fn apply(
+        &mut self,
+        id: &str,
+        target: Option<ActionTarget>,
+        consent: Option<OverwriteConsent>,
+    ) -> Result<ExtensionActionResult, String> {
+        let (profile, entry, installed) = self.resolve(id, target.as_ref())?;
+        if !entry.available || entry.problem.is_some() {
+            return Err("The catalog entry is unavailable; Sync first".into());
+        }
+        let version = entry
+            .pending_version
+            .as_deref()
+            .ok_or("Download the extension first")?;
+        if compare_versions(version, &entry.remote_version)? != Ordering::Equal {
+            return Err("The downloaded version is stale; download the available version".into());
+        }
+        if let Some(item) = &installed {
+            if compare_versions(version, &item.version)? != Ordering::Greater {
+                return Err("This installation is already current; downgrade blocked".into());
+            }
+        }
+        let pending = self.paths.pending_dir(id, version);
+        if entry.pending_hashes.is_empty() || hash_directory(&pending)? != entry.pending_hashes {
+            return Err("Downloaded files are missing or have changed; download again".into());
+        }
+        let downloaded: ChromeManifest = serde_json::from_slice(
+            &fs::read(pending.join("manifest.json")).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        if downloaded.name != entry.name || downloaded.version != version {
+            return Err("Downloaded manifest does not match the catalog".into());
+        }
+        let active = installed
+            .as_ref()
+            .map(|i| PathBuf::from(&i.path))
+            .unwrap_or_else(|| self.paths.extension_dir(id));
+        if installed.is_some() {
+            let current: serde_json::Value = serde_json::from_slice(
+                &fs::read(active.join("manifest.json")).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+            let next: serde_json::Value = serde_json::from_slice(
+                &fs::read(pending.join("manifest.json")).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+            if current.get("key") != next.get("key") {
+                return Err("The manifest key changed; updating would change the Chrome ID. Installation blocked to preserve extension data".into());
+            }
+        }
+        let before = if active.exists() {
+            Some(hash_directory(&active)?)
+        } else {
+            None
+        };
+        if let Some(required) = self.prepare_installation(id, target.as_ref())? {
+            let approved = consent.as_ref().is_some_and(|c| {
+                c.profile_id == required.profile_id
+                    && registration::same_path(Path::new(&c.path), Path::new(&required.path))
+                    && c.hashes == required.hashes
+            });
+            if !approved {
+                return Err(format!(
+                    "Confirm replacement of {} with a backup before installing",
+                    active.display()
+                ));
+            }
+        }
+        let automation = self.automation.for_profile(&profile)?;
+        let checker = Arc::clone(&automation);
+        let path = active.clone();
+        let expected = installed.as_ref().map(|i| i.chrome_extension_id.clone());
+        tauri::async_runtime::spawn_blocking(move || {
+            checker.preflight()?;
+            if let Some(id) = expected {
+                checker.verify_identity(&path, &id)?;
+            }
+            Ok::<_, String>(())
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        // Keep copies and backups beside the active directory so promotion and
+        // rollback work even when the installation is on another volume.
+        let parent = active
+            .parent()
+            .ok_or("The installation cannot be a filesystem root")?;
+        let leaf = active
+            .file_name()
+            .ok_or("Invalid installation directory")?
+            .to_string_lossy();
+        let stamp = Utc::now().timestamp_nanos_opt().unwrap_or_default();
+        let prepared = parent.join(format!(".nox-prepared-{leaf}-{stamp}"));
+        let backup = parent.join(format!(".nox-backup-{leaf}-{stamp}"));
+        fs::create_dir_all(&prepared).map_err(|e| e.to_string())?;
+        copy_directory(&pending, &prepared)?;
+        if hash_directory(&prepared)? != entry.pending_hashes {
+            return Err("Prepared files changed; installation blocked".into());
+        }
+        // Re-read registration and files immediately before changing anything.
+        self.resolve(id, target.as_ref())?;
+        if before.as_ref().is_some_and(|h| {
+            hash_directory(&active)
+                .as_ref()
+                .map_or(true, |current| current != h)
+        }) || (before.is_none() && active.exists())
+        {
+            return Err("Installed files changed during confirmation; retry".into());
+        }
+        if active.exists() {
+            fs::rename(&active, &backup).map_err(|e| format!("Could not create backup: {e}"))?;
+        }
+        if let Err(error) = fs::rename(&prepared, &active) {
+            if backup.exists() {
+                fs::rename(&backup, &active).map_err(|e| {
+                    format!(
+                        "Activation failed: {error}; rollback failed: {e}; backup: {}",
+                        backup.display()
+                    )
+                })?;
+            }
+            return Err(format!("Activation failed: {error}"));
+        }
+        let backend = Arc::clone(&automation);
+        let action_path = active.clone();
+        let action_version = version.to_string();
+        let expected = installed.as_ref().map(|i| i.chrome_extension_id.clone());
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            let id = if let Some(id) = expected {
+                backend.reload(&action_path, &id, &action_version)?;
+                id
+            } else {
+                backend.install(&action_path, &action_version)?
+            };
+            backend.verify_identity(&action_path, &id)?;
+            Ok::<_, String>(id)
+        })
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()));
+        if let Err(error) = result {
+            if !backup.exists() {
+                return Err(format!("Chrome did not confirm installation: {error}. Files were kept at {}; Sync to refresh the actual registration", active.display()));
+            }
+            let failed = parent.join(format!(".nox-failed-{leaf}-{stamp}"));
+            fs::rename(&active, &failed).map_err(|e| {
+                format!(
+                    "Chrome failed: {error}; could not move failed files: {e}; backup: {}",
+                    backup.display()
+                )
+            })?;
+            if backup.exists() {
+                fs::rename(&backup, &active).map_err(|e| {
+                    format!(
+                        "Chrome failed: {error}; rollback failed: {e}; backup: {}",
+                        backup.display()
+                    )
+                })?;
+                if let Some(previous) = installed {
+                    let backend = Arc::clone(&automation);
+                    let path = active.clone();
+                    let reload = tauri::async_runtime::spawn_blocking(move || {
+                        backend.reload(&path, &previous.chrome_extension_id, &previous.version)
+                    })
+                    .await;
+                    if !matches!(reload, Ok(Ok(()))) {
+                        return Err(format!("Files restored, but Chrome did not confirm the previous version: {error}"));
+                    }
+                }
+            }
             return Err(format!(
-                "Chrome could not apply the update, so the previous version was restored: {error}"
+                "Chrome did not confirm installation; previous files were restored: {error}"
             ));
         }
-
-        extension.active_version = Some(pending_version.clone());
-        extension.active_hashes = std::mem::take(&mut extension.pending_hashes);
-        extension.pending_version = None;
-        chrome.extensions.insert(
-            id.to_string(),
-            ChromeInstallRecord {
-                chrome_extension_id: installed.chrome_extension_id,
-                version: pending_version,
-                installed_at: Utc::now().to_rfc3339(),
-            },
-        );
-        self.paths.save_repository_state(&repository)?;
-        self.paths.save_chrome_state(&chrome)?;
-        if let Err(error) = prune_backups(&backup_dir, 3) {
-            self.paths
-                .log(&format!("Could not prune old backups for {id}: {error}"));
-        }
-        self.paths.log(&format!("Updated extension {id}"));
-        self.result("Extension updated successfully", &repository, &chrome)
-    }
-
-    pub async fn remove(&mut self, id: &str) -> Result<ExtensionActionResult, String> {
-        let mut repository = self.paths.load_repository_state()?;
-        self.refresh_local_manifests(&mut repository)?;
-        let mut chrome = self.chrome_state(&repository)?;
-        let installed = chrome
+        let mut state = self.paths.load_repository_state()?;
+        let saved = state
             .extensions
-            .get(id)
-            .cloned()
-            .ok_or_else(|| format!("{id} is not registered as installed"))?;
-        let automation = Arc::clone(&self.automation);
-        let path = self.paths.extension_dir(id);
-        tauri::async_runtime::spawn_blocking(move || {
-            automation.verify_identity(&path, &installed.chrome_extension_id)?;
-            automation.remove(&path, &installed.chrome_extension_id)
-        })
-        .await
-        .map_err(|error| format!("Chrome automation task failed: {error}"))??;
-        chrome.extensions.remove(id);
-        self.paths.save_chrome_state(&chrome)?;
-        self.paths
-            .log(&format!("Removed extension {id} from Chrome"));
-        self.result(
-            "Extension removed from Chrome; local files were kept",
-            &repository,
-            &chrome,
-        )
+            .get_mut(id)
+            .ok_or("Catalog entry disappeared")?;
+        saved.active_hashes = entry.pending_hashes.clone();
+        saved.trusted_path = Some(active.to_string_lossy().to_string());
+        saved.active_version = Some(version.into());
+        self.paths.save_repository_state(&state)?;
+        self.paths.log(&format!(
+            "Installed {id} in {}. Backup: {}",
+            profile.id,
+            backup.display()
+        ));
+        self.result("Extension installed successfully; previous files were kept as a backup")
     }
 
-    pub async fn repair(&mut self, id: &str) -> Result<ExtensionActionResult, String> {
-        let mut repository = self.paths.load_repository_state()?;
-        self.refresh_local_manifests(&mut repository)?;
-        let mut chrome = self.chrome_state(&repository)?;
-        self.repository
-            .restore_files(&self.paths, &mut repository, &chrome, id)
-            .await?;
-        let extension = repository
-            .extensions
-            .get(id)
-            .ok_or_else(|| format!("Unknown extension: {id}"))?;
-        ensure_actionable(extension.problem.as_deref())?;
-        let version = extension
-            .active_version
-            .clone()
-            .ok_or_else(|| "No local version is ready to repair".to_string())?;
-        let path = self.paths.extension_dir(id);
-        let automation = Arc::clone(&self.automation);
-        let action_version = version.clone();
-        let chrome_id = tauri::async_runtime::spawn_blocking(move || {
-            // Resolve the actual registration by path; never retry a stored ID
-            // which may have belonged to a different extension all along.
-            let chrome_id = automation.install(&path, &action_version)?;
-            automation.verify_identity(&path, &chrome_id)?;
-            Ok::<_, String>(chrome_id)
-        })
-        .await
-        .map_err(|error| format!("Chrome automation task failed: {error}"))??;
-        chrome.extensions.insert(
-            id.to_string(),
-            ChromeInstallRecord {
-                chrome_extension_id: chrome_id,
-                version,
-                installed_at: Utc::now().to_rfc3339(),
-            },
-        );
-        self.paths.save_chrome_state(&chrome)?;
-        self.result("Repository files restored and Chrome installation repaired; previous files were backed up", &repository, &chrome)
-    }
-
-    fn refresh_local_manifests(&self, repository: &mut RepositoryState) -> Result<(), String> {
-        let mut ids: BTreeSet<String> = repository.extensions.keys().cloned().collect();
-        for directory in fs::read_dir(&self.paths.root).map_err(|error| error.to_string())? {
-            let directory = directory.map_err(|error| error.to_string())?;
-            let id = directory.file_name().to_string_lossy().to_string();
-            if !id.is_empty()
-                && id
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-                && directory.path().join("manifest.json").is_file()
-            {
-                ids.insert(id);
-            }
-        }
-        for id in ids {
-            let path = self.paths.extension_dir(&id);
-            let bytes = match fs::read(path.join("manifest.json")) {
-                Ok(bytes) => bytes,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(format!("Could not read {id}/manifest.json: {error}")),
-            };
-            let manifest: ChromeManifest = match serde_json::from_slice(&bytes) {
-                Ok(manifest) => manifest,
-                Err(error) => {
-                    if let Some(entry) = repository.extensions.get_mut(&id) {
-                        entry.problem = Some(format!("Invalid local manifest: {error}"));
-                    }
-                    continue;
-                }
-            };
-            compare_versions(&manifest.version, &manifest.version)?;
-            let entry =
-                repository
-                    .extensions
-                    .entry(id.clone())
-                    .or_insert_with(|| ManagedExtension {
-                        id: id.clone(),
-                        name: manifest.name.clone(),
-                        description: manifest.description.clone(),
-                        ..ManagedExtension::default()
-                    });
-            // Read installed versions from disk, but retain the last trusted
-            // hashes. Recognizing an installation must not authorize overwrites.
-            entry.active_version = Some(manifest.version.clone());
-            if entry.pending_version.as_ref().is_some_and(|pending| {
-                compare_versions(pending, &manifest.version)
-                    .is_ok_and(|order| order != std::cmp::Ordering::Greater)
-            }) {
-                entry.pending_version = None;
-                entry.pending_hashes.clear();
-            }
-            if entry
-                .problem
-                .as_deref()
-                .is_some_and(|problem| problem.starts_with("Invalid local manifest"))
-            {
-                entry.problem = None;
-            }
-        }
-        Ok(())
-    }
-
-    fn chrome_state(&self, repository: &RepositoryState) -> Result<ChromeState, String> {
-        let previous = self.paths.load_chrome_state()?;
-        let mut chrome = ChromeState::default();
-        for (id, extension) in &repository.extensions {
-            if let Some(chrome_id) = self
-                .automation
-                .registered_id(&self.paths.extension_dir(id))?
-            {
-                let old = previous
-                    .extensions
-                    .get(id)
-                    .filter(|record| record.chrome_extension_id == chrome_id);
-                chrome.extensions.insert(
-                    id.clone(),
-                    ChromeInstallRecord {
-                        chrome_extension_id: chrome_id,
-                        version: extension
-                            .active_version
-                            .clone()
-                            .or_else(|| old.map(|record| record.version.clone()))
-                            .unwrap_or_else(|| "unknown".into()),
-                        installed_at: old
-                            .map(|record| record.installed_at.clone())
-                            .unwrap_or_else(|| Utc::now().to_rfc3339()),
-                    },
-                );
-            }
-        }
-        self.paths.save_chrome_state(&chrome)?;
-        Ok(chrome)
-    }
-
-    fn result(
-        &self,
-        message: &str,
-        repository: &crate::model::RepositoryState,
-        chrome: &crate::model::ChromeState,
+    pub async fn remove_selected(
+        &mut self,
+        id: &str,
+        target: ActionTarget,
     ) -> Result<ExtensionActionResult, String> {
+        let (profile, _, installed) = self.resolve(id, Some(&target))?;
+        let installed = installed.ok_or("Select an installed extension")?;
+        let before = registration::inventory(Path::new(&profile.path))?;
+        let backend = self.automation.for_profile(&profile)?;
+        let path = PathBuf::from(&installed.path);
+        let chrome_id = installed.chrome_extension_id.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            backend.verify_identity(&path, &chrome_id)?;
+            backend.remove(&path, &chrome_id)
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        let after = registration::inventory(Path::new(&profile.path))?;
+        if after
+            .iter()
+            .any(|i| i.chrome_extension_id == installed.chrome_extension_id)
+        {
+            return Err("Chrome still reports the selected extension".into());
+        }
+        if before.iter().any(|i| {
+            i.chrome_extension_id != installed.chrome_extension_id
+                && !after
+                    .iter()
+                    .any(|j| j.chrome_extension_id == i.chrome_extension_id)
+        }) {
+            return Err("Another Chrome registration changed during removal; no further action was attempted".into());
+        }
+        self.result("Selected extension removed from Chrome; local files were kept")
+    }
+
+    fn result(&self, message: &str) -> Result<ExtensionActionResult, String> {
         Ok(ExtensionActionResult {
             message: message.into(),
-            snapshot: build_snapshot(
-                &self.paths,
-                repository,
-                chrome,
-                self.repository.repository_url(),
-            ),
+            snapshot: self.snapshot()?,
         })
+    }
+
+    #[cfg(test)]
+    pub async fn install(&mut self, id: &str) -> Result<ExtensionActionResult, String> {
+        self.apply(id, None, None).await
+    }
+    #[cfg(test)]
+    pub async fn update(&mut self, id: &str) -> Result<ExtensionActionResult, String> {
+        self.apply(id, None, None).await
+    }
+    #[cfg(test)]
+    pub async fn remove(&mut self, _: &str) -> Result<ExtensionActionResult, String> {
+        Err("Exact Chrome target is required".into())
     }
 }
 
-fn ensure_actionable(problem: Option<&str>) -> Result<(), String> {
-    problem.map_or(Ok(()), |problem| Err(problem.to_string()))
-}
-
+#[cfg(test)]
 fn prune_backups(directory: &std::path::Path, keep: usize) -> Result<(), String> {
     let mut backups: Vec<_> = fs::read_dir(directory)
         .map_err(|error| format!("Could not inspect extension backups: {error}"))?

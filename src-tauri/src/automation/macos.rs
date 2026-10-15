@@ -33,11 +33,22 @@ const KEY_ESCAPE: u16 = 53;
 const KEY_COMMAND: u16 = 55;
 const KEY_SHIFT: u16 = 56;
 
-pub struct MacOsChromeAutomation;
+pub struct MacOsChromeAutomation {
+    profile: Option<crate::model::ChromeProfile>,
+}
 
 impl MacOsChromeAutomation {
     pub fn new() -> Self {
-        Self
+        Self { profile: None }
+    }
+
+    fn profile_directory(&self) -> Result<PathBuf, String> {
+        if let Some(profile) = &self.profile {
+            return Ok(PathBuf::from(&profile.path));
+        }
+        Ok(dirs::home_dir()
+            .ok_or("Home directory unavailable")?
+            .join("Library/Application Support/Google/Chrome/Default"))
     }
 
     fn chrome_app_path(&self) -> Result<PathBuf, String> {
@@ -67,7 +78,13 @@ impl MacOsChromeAutomation {
 
         Command::new(chrome)
             .args([
-                "--profile-directory=Default",
+                &format!(
+                    "--profile-directory={}",
+                    self.profile
+                        .as_ref()
+                        .map(|p| p.id.as_str())
+                        .unwrap_or("Default")
+                ),
                 "--new-window",
                 "chrome://extensions/",
             ])
@@ -196,10 +213,16 @@ impl MacOsChromeAutomation {
 }
 
 impl BrowserAutomationBackend for MacOsChromeAutomation {
+    fn for_profile(
+        &self,
+        profile: &crate::model::ChromeProfile,
+    ) -> Result<std::sync::Arc<dyn BrowserAutomationBackend>, String> {
+        Ok(std::sync::Arc::new(Self {
+            profile: Some(profile.clone()),
+        }))
+    }
     fn registered_id(&self, extension_path: &Path) -> Result<Option<String>, String> {
-        let profile = dirs::home_dir()
-            .ok_or("The home directory could not be resolved")?
-            .join("Library/Application Support/Google/Chrome/Default");
+        let profile = self.profile_directory()?;
         if !profile.is_dir() {
             return Ok(None);
         }
@@ -224,6 +247,16 @@ impl BrowserAutomationBackend for MacOsChromeAutomation {
             return Err("The prepared extension does not contain manifest.json".into());
         }
 
+        let profile = self.profile_directory()?;
+        let before = registration::load_stamp(&profile, extension_path)?;
+        let expected_id = registration::registered_id(&profile, extension_path)?;
+        let manifest: crate::model::ChromeManifest = serde_json::from_slice(
+            &std::fs::read(extension_path.join("manifest.json")).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        if manifest.version != expected_version {
+            return Err("Local manifest version changed".into());
+        }
         self.with_extensions_page(|app, window| {
             let load_unpacked = find_element(window, &is_load_unpacked_button)
                 .ok_or("Load unpacked was not exposed through Chrome accessibility")?;
@@ -235,11 +268,15 @@ impl BrowserAutomationBackend for MacOsChromeAutomation {
 
             let deadline = Instant::now() + Duration::from_secs(10);
             let chrome_id = loop {
-                let profile = dirs::home_dir()
-                    .ok_or("The home directory could not be resolved")?
-                    .join("Library/Application Support/Google/Chrome/Default");
+                let profile = self.profile_directory()?;
                 if let Some(id) = registration::registered_id(&profile, extension_path)? {
-                    break id;
+                    if expected_id.as_ref().is_some_and(|expected| expected != &id) {
+                        return Err("Chrome registered a different extension ID".into());
+                    }
+                    let after = registration::load_stamp(&profile, extension_path)?;
+                    if after.is_some() && after != before {
+                        break id;
+                    }
                 }
                 if Instant::now() >= deadline {
                     return Err(
@@ -250,7 +287,7 @@ impl BrowserAutomationBackend for MacOsChromeAutomation {
                 thread::sleep(Duration::from_millis(150));
             };
 
-            Self::verify_version(window, &chrome_id, expected_version)?;
+            registration::verify(&profile, extension_path, &chrome_id)?;
             Ok(chrome_id)
         })
     }
@@ -260,20 +297,51 @@ impl BrowserAutomationBackend for MacOsChromeAutomation {
         extension_path: &Path,
         chrome_extension_id: &str,
     ) -> Result<(), String> {
-        let profile = dirs::home_dir()
-            .ok_or("The home directory could not be resolved")?
-            .join("Library/Application Support/Google/Chrome/Default");
+        let profile = self.profile_directory()?;
         registration::verify(&profile, extension_path, chrome_extension_id)
     }
 
-    fn reload(&self, _: &Path, _: &str, _: &str) -> Result<(), String> {
-        self.preflight()?;
-        Err(Self::unavailable_action("extension reload"))
+    fn reload(&self, path: &Path, id: &str, version: &str) -> Result<(), String> {
+        self.verify_identity(path, id)?;
+        let actual = self.install(path, version)?;
+        if actual != id {
+            return Err("Chrome extension identity changed".into());
+        }
+        Ok(())
     }
 
-    fn remove(&self, _: &Path, _: &str) -> Result<(), String> {
+    fn remove(&self, path: &Path, id: &str) -> Result<(), String> {
         self.preflight()?;
-        Err(Self::unavailable_action("extension removal"))
+        self.verify_identity(path, id)?;
+        let manifest: crate::model::ChromeManifest = serde_json::from_slice(
+            &std::fs::read(path.join("manifest.json")).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        self.with_extensions_page(|_, window| {
+            let card = unique_element(window, &|e| attribute_string(e.identifier()).as_deref() == Some(id))?;
+            let remove = unique_element(&card, &|e| attribute_string(e.identifier()).as_deref() == Some("removeButton"))?;
+            self.verify_identity(path, id)?;
+            remove.press().map_err(|e| e.to_string())?;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let dialog = loop {
+                if let Ok(dialog) = unique_element(window, &|e| {
+                    matches!(attribute_string(e.role()).as_deref(), Some("AXDialog") | Some("AXSheet"))
+                        && tree_contains_text(e, &manifest.name)
+                }) { break dialog; }
+                if Instant::now() >= deadline { return Err("Chrome did not expose a unique confirmation for this extension; removal blocked".into()); }
+                thread::sleep(Duration::from_millis(100));
+            };
+            let confirm = unique_element(&dialog, &|e| attribute_string(e.role()).as_deref() == Some("AXButton")
+                && element_strings(e).iter().any(|text| text == "Remove" || text == "Remover"))?;
+            self.verify_identity(path, id)?;
+            confirm.press().map_err(|e| e.to_string())?;
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while registration::registered_id(&self.profile_directory()?, path)?.is_some() {
+                if Instant::now() >= deadline { return Err("Chrome still reports the selected extension".into()); }
+                thread::sleep(Duration::from_millis(100));
+            }
+            Ok(())
+        })
     }
 }
 
@@ -498,4 +566,23 @@ fn extract_chrome_extension_id(value: &str) -> Option<String> {
         .split(|character| !('a'..='p').contains(&character))
         .find(|candidate| candidate.len() == 32)
         .map(str::to_string)
+}
+
+fn unique_element(
+    root: &AXUIElement,
+    predicate: &impl Fn(&AXUIElement) -> bool,
+) -> Result<AXUIElement, String> {
+    let mut matches = Vec::new();
+    visit_elements(root, &mut |element| {
+        if predicate(element) {
+            matches.push(element.clone());
+        }
+    });
+    if matches.len() != 1 {
+        return Err(format!(
+            "Expected one unambiguous Chrome control, found {}; action blocked",
+            matches.len()
+        ));
+    }
+    Ok(matches.remove(0))
 }

@@ -3,11 +3,10 @@ mod model;
 mod repository;
 mod service;
 mod storage;
-mod update_cleanup;
 
 use std::sync::Arc;
 
-use model::{ExtensionActionResult, ManagerSnapshot};
+use model::{ActionTarget, ExtensionActionResult, ManagerSnapshot, OverwriteConsent};
 use service::ManagerService;
 use tauri::State;
 use tokio::sync::Mutex;
@@ -27,35 +26,66 @@ async fn sync_extensions(state: State<'_, AppState>) -> Result<ManagerSnapshot, 
 }
 
 #[tauri::command]
-async fn install_extension(
+async fn select_chrome_profile(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<ManagerSnapshot, String> {
+    state.manager.lock().await.select_profile(&id)
+}
+
+#[tauri::command]
+async fn download_extension(
     id: String,
     state: State<'_, AppState>,
 ) -> Result<ExtensionActionResult, String> {
-    state.manager.lock().await.install(&id).await
+    state.manager.lock().await.download(&id).await
+}
+
+#[tauri::command]
+async fn prepare_installation(
+    id: String,
+    target: Option<ActionTarget>,
+    state: State<'_, AppState>,
+) -> Result<Option<OverwriteConsent>, String> {
+    state
+        .manager
+        .lock()
+        .await
+        .prepare_installation(&id, target.as_ref())
+}
+
+#[tauri::command]
+async fn install_extension(
+    id: String,
+    target: Option<ActionTarget>,
+    consent: Option<OverwriteConsent>,
+    state: State<'_, AppState>,
+) -> Result<ExtensionActionResult, String> {
+    state.manager.lock().await.apply(&id, target, consent).await
 }
 
 #[tauri::command]
 async fn update_extension(
     id: String,
+    target: Option<ActionTarget>,
+    consent: Option<OverwriteConsent>,
     state: State<'_, AppState>,
 ) -> Result<ExtensionActionResult, String> {
-    state.manager.lock().await.update(&id).await
+    state.manager.lock().await.apply(&id, target, consent).await
 }
 
 #[tauri::command]
 async fn remove_extension(
     id: String,
+    target: ActionTarget,
     state: State<'_, AppState>,
 ) -> Result<ExtensionActionResult, String> {
-    state.manager.lock().await.remove(&id).await
-}
-
-#[tauri::command]
-async fn repair_extension(
-    id: String,
-    state: State<'_, AppState>,
-) -> Result<ExtensionActionResult, String> {
-    state.manager.lock().await.repair(&id).await
+    state
+        .manager
+        .lock()
+        .await
+        .remove_selected(&id, target)
+        .await
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -85,8 +115,9 @@ pub fn run() {
             install_extension,
             update_extension,
             remove_extension,
-            repair_extension,
-            update_cleanup::nox_prepare_update_relaunch_with_local_data_reset,
+            download_extension,
+            select_chrome_profile,
+            prepare_installation,
         ])
         .run(tauri::generate_context!())
         .expect("error while running NoX Extension Manager");

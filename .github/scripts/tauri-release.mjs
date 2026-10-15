@@ -109,7 +109,8 @@ const release = await getOrCreateRelease({
   token,
   releaseName,
   releaseNotes,
-  draft,
+  // New releases stay private until installers, signatures and metadata exist.
+  draft: true,
   prerelease,
 });
 
@@ -144,6 +145,21 @@ await uploadReleaseAsset({
   assetPath: latestJsonPath,
   assetName: 'latest.json',
 });
+
+if (release.draft && !draft) {
+  await githubRequest({
+    token, method: 'PATCH', pathName: `/repos/${repository}/releases/${release.id}`,
+    body: { draft: false, make_latest: prerelease ? 'false' : 'true' },
+  });
+}
+if (!draft || !release.draft) {
+  for (const candidate of selected) {
+    const asset = uploadedAssets.get(path.resolve(candidate.assetPath));
+    const url = releaseAssetUrl(repository, tagName, asset.name);
+    const response = await fetch(url, { method: 'HEAD', redirect: 'follow' });
+    if (!response.ok) fail(`Published installer returned ${response.status}: ${url}`);
+  }
+}
 
 printSummary({ artifactDir, latestJsonPath, repository, tagName, version, selected, uploadAssets });
 console.log(`Release ${tagName} is ready: https://github.com/${repository}/releases/tag/${tagName}`);
@@ -343,7 +359,7 @@ async function getOrCreateRelease({
       target_commitish: envValue('GITHUB_SHA'),
       draft,
       prerelease,
-      make_latest: prerelease ? 'false' : 'true',
+      ...(draft ? {} : { make_latest: prerelease ? 'false' : 'true' }),
     },
   });
 }

@@ -17,11 +17,13 @@ const FOLDER_PICKER_CONFIRM_ID: &str = "1";
 const REMOVE_BUTTON_ID: &str = "removeButton";
 const REMOVE_NAMES: &[&str] = &["Remove", "Remover"];
 
-pub struct WindowsChromeAutomation;
+pub struct WindowsChromeAutomation {
+    profile: Option<crate::model::ChromeProfile>,
+}
 
 impl WindowsChromeAutomation {
     pub fn new() -> Self {
-        Self
+        Self { profile: None }
     }
 
     fn chrome_path() -> Result<PathBuf, String> {
@@ -53,7 +55,17 @@ impl WindowsChromeAutomation {
             .collect();
 
         Command::new(chrome)
-            .args(["--profile-directory=Default", "--new-window", "about:blank"])
+            .args([
+                format!(
+                    "--profile-directory={}",
+                    self.profile
+                        .as_ref()
+                        .map(|p| p.id.as_str())
+                        .unwrap_or("Default")
+                ),
+                "--new-window".into(),
+                "about:blank".into(),
+            ])
             .spawn()
             .map_err(|error| format!("Could not open Google Chrome: {error}"))?;
 
@@ -203,7 +215,7 @@ impl WindowsChromeAutomation {
         self.preflight()?;
         verify_local_version(extension_path, expected_version)?;
         self.with_extensions_page(|automation, window| {
-            let profile = Self::profile_directory()?;
+            let profile = self.profile_directory()?;
             let before = registration::load_stamp(&profile, extension_path)?;
             let buttons = automation.create_matcher().from(window.clone())
                 .control_type(ControlType::Button)
@@ -364,7 +376,10 @@ impl WindowsChromeAutomation {
         exactly_one(buttons, label)
     }
 
-    fn profile_directory() -> Result<PathBuf, String> {
+    fn profile_directory(&self) -> Result<PathBuf, String> {
+        if let Some(profile) = &self.profile {
+            return Ok(PathBuf::from(&profile.path));
+        }
         std::env::var_os("LOCALAPPDATA")
             .map(|local| PathBuf::from(local).join(r"Google\Chrome\User Data\Default"))
             .ok_or_else(|| "Chrome's Default profile directory could not be resolved".into())
@@ -372,8 +387,16 @@ impl WindowsChromeAutomation {
 }
 
 impl BrowserAutomationBackend for WindowsChromeAutomation {
+    fn for_profile(
+        &self,
+        profile: &crate::model::ChromeProfile,
+    ) -> Result<std::sync::Arc<dyn BrowserAutomationBackend>, String> {
+        Ok(std::sync::Arc::new(Self {
+            profile: Some(profile.clone()),
+        }))
+    }
     fn registered_id(&self, extension_path: &Path) -> Result<Option<String>, String> {
-        let profile = Self::profile_directory()?;
+        let profile = self.profile_directory()?;
         if !profile.is_dir() {
             return Ok(None);
         }
@@ -395,7 +418,7 @@ impl BrowserAutomationBackend for WindowsChromeAutomation {
         chrome_extension_id: &str,
     ) -> Result<(), String> {
         registration::verify(
-            &Self::profile_directory()?,
+            &self.profile_directory()?,
             extension_path,
             chrome_extension_id,
         )
@@ -467,8 +490,7 @@ impl BrowserAutomationBackend for WindowsChromeAutomation {
             self.verify_identity(extension_path, chrome_extension_id)?;
             invoke(&confirm, "Confirm Remove")?;
             let deadline = Instant::now() + Duration::from_secs(15);
-            while registration::registered_id(&Self::profile_directory()?, extension_path)?
-                .is_some()
+            while registration::registered_id(&self.profile_directory()?, extension_path)?.is_some()
             {
                 if Instant::now() >= deadline {
                     return Err("Chrome still reports the extension after Remove".into());

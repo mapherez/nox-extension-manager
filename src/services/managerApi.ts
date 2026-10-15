@@ -1,6 +1,6 @@
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { invoke, isTauri } from '@tauri-apps/api/core';
-import type { ExtensionAction, ExtensionActionResult, ManagerSnapshot } from '../types';
+import type { ActionOptions, ActionTarget, OverwriteConsent, ExtensionAction, ExtensionActionResult, ManagerSnapshot } from '../types';
 
 const repositoryUrl = "https://github.com/mapherez/nox-extension-manager";
 
@@ -54,11 +54,21 @@ export async function syncExtensions() {
   return invoke<ManagerSnapshot>('sync_extensions');
 }
 
-export async function runExtensionAction(action: ExtensionAction, id: string) {
+export async function selectChromeProfile(id: string) {
+  if (!isTauri()) return browserPreview;
+  return invoke<ManagerSnapshot>('select_chrome_profile', { id });
+}
+
+export async function prepareInstallation(id: string, target?: ActionTarget) {
+  if (!isTauri()) return null;
+  return invoke<OverwriteConsent | null>('prepare_installation', { id, target: target ?? null });
+}
+
+export async function runExtensionAction(action: ExtensionAction, id: string, options: ActionOptions = {}) {
   if (!isTauri()) {
     return { message: `${action} preview completed`, snapshot: browserPreview };
   }
-  return invoke<ExtensionActionResult>(`${action}_extension`, { id });
+  return invoke<ExtensionActionResult>(`${action}_extension`, { id, target: options.target ?? null, consent: options.consent ?? null });
 }
 
 export function localIconUrl(path: string | null) {
