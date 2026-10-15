@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "Hero Bookmarks",
+  "version": "1.1.0",
+  "minimum_chrome_version": "134",
+  "description": "Find, open and organize your Chrome bookmarks in a floating launcher with folders, drag and drop, and light and dark themes.",
+  "permissions": ["bookmarks", "scripting", "activeTab", "favicon", "storage"],
+  "icons": { "16": "icons/icon-16.png", "32": "icons/icon-32.png", "48": "icons/icon-48.png", "128": "icons/icon-128.png" },
+  "web_accessible_resources": [
+    {
+      "resources": ["_favicon/*"],
+      "matches": ["<all_urls>"],
+      "use_dynamic_url": false
+    }
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Open Hero Bookmarks",
+    "default_icon": { "16": "icons/icon-16.png", "32": "icons/icon-32.png" }
+  },
+  "options_ui": { "page": "settings.html", "open_in_tab": true },
+  "commands": {
+    "toggle-panel": {
+      "suggested_key": {
+        "default": "Alt+B"
+      },
+      "description": "Toggle bookmark panel"
+    }
+  }
+}
