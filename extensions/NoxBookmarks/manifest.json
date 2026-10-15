@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
-  "name": "Hero Bookmarks",
-  "version": "1.1.1",
+  "name": "NoX Bookmarks",
+  "version": "1.1.2",
   "minimum_chrome_version": "134",
   "description": "Find, open and organize your Chrome bookmarks in a floating launcher with folders, drag and drop, and light and dark themes.",
   "permissions": ["bookmarks", "scripting", "activeTab", "favicon", "storage"],
@@ -17,7 +17,7 @@
     "service_worker": "background.js"
   },
   "action": {
-    "default_title": "Open Hero Bookmarks",
+    "default_title": "Open NoX Bookmarks",
     "default_icon": { "16": "icons/icon-16.png", "32": "icons/icon-32.png" }
   },
   "options_ui": { "page": "settings.html", "open_in_tab": true },
