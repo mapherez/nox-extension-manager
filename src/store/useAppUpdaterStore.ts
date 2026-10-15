@@ -26,10 +26,7 @@ export const useAppUpdaterStore = create<AppUpdaterStore>((set, get) => ({
   bannerVisible: false,
   error: null,
   check: async (showBanner = true) => {
-    if (get().status === 'available' && get().updateInfo) {
-      if (showBanner) set({ bannerVisible: true });
-      return;
-    }
+    if (get().status === 'installing') return;
     if (activeCheck) return activeCheck;
     set({ status: 'checking', error: null });
     activeCheck = checkForAppUpdate()
@@ -53,10 +50,18 @@ export const useAppUpdaterStore = create<AppUpdaterStore>((set, get) => ({
   showBanner: () => set({ bannerVisible: true }),
   dismissBanner: () => set({ bannerVisible: false }),
   install: async () => {
-    const updateInfo = get().updateInfo;
-    if (!updateInfo || get().status === 'installing') return;
+    if (!get().updateInfo || ['installing', 'checking'].includes(get().status)) return;
     set({ status: 'installing', progress: null, error: null });
     try {
+      // Resolve latest again at the user's click, including retries after a
+      // corrected release manifest. Never reuse a stale download URL.
+      const updateInfo = await checkForAppUpdate();
+      const checkedAt = new Date().toISOString();
+      if (!updateInfo) {
+        set({ status: 'upToDate', updateInfo: null, checkedAt, bannerVisible: false });
+        return;
+      }
+      set({ updateInfo, checkedAt });
       await installAppUpdate(updateInfo.update, (progress) => set({ progress }));
     } catch (error) {
       set({

@@ -11,14 +11,15 @@ adapters.
 - Discovers immediate folders under `extensions/` that contain a Manifest V3
   `manifest.json`; there is no separate catalogue.
 - Reads only `mapherez/nox-extension-manager`, currently from `master`, and
-  pins downloads to the exact commit SHA returned by GitHub.
-- Uses ETag/commit caching, verifies Git object hashes and records SHA-256
-  snapshots of local files. Every sync reconciles the extension tree even
-  after a `304 Not Modified`, so missing entries and failed downloads recover.
+  lists `extensions/` directly through GitHub's contents API.
+- Reads every extension's root `manifest.json` on each sync and compares its
+  version. It does not request commit metadata or history. File hashes from
+  directory listings verify downloads; SHA-256 snapshots protect local edits.
 - Downloads new extensions immediately. Updates for registered Chrome
   extensions remain staged until the user clicks **Update**.
-- Blocks changed content unless `manifest.json` contains a strictly newer
-  version, and blocks updates when active local files were modified.
+- Downloads an update when `manifest.json` contains a newer version, and
+  blocks updates when active local files were modified. Changes published
+  without increasing the manifest version are not treated as an update.
 - Automates Install, Update, Remove and Repair through Windows UI Automation.
   Chrome's read-only profile registrations must associate the requested
   directory with the exact Chrome ID before an action can proceed. Controls
@@ -52,7 +53,7 @@ removes this Documents directory.
 ### Recovering extensions
 
 Use **Sync extensions** after deleting an extension's download directory. NoX
-downloads it again even if the repository commit has not changed. If NoX's
+downloads it again even if the manifest version has not changed. If NoX's
 repository state was reset, existing directories are accepted only when all
 their file hashes match the repository; differing files are left untouched.
 
@@ -95,6 +96,10 @@ https://github.com/mapherez/nox-extension-manager/releases/latest/download/lates
 ```
 
 The updater public key is already configured in `src-tauri/tauri.conf.json`.
+App updates use the latest release's signed manifest, independently of extension
+versions and repository history. **Install now** fetches that manifest again
+before downloading, so retries use the current published URL.
+
 To publish signed updates:
 
 1. Store the matching private key contents in the repository secret

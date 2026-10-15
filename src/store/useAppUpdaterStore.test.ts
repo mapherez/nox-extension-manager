@@ -69,6 +69,7 @@ describe('app updater banner persistence', () => {
   });
 
   it('returns to an actionable state after installation fails', async () => {
+    updaterMocks.checkForAppUpdate.mockResolvedValue(updateInfo);
     const partialProgress: UpdateProgress = {
       downloadedBytes: 64,
       totalBytes: 128,

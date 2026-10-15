@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use chrono::Utc;
-use reqwest::header::{ACCEPT, ETAG, IF_NONE_MATCH, USER_AGENT};
+use reqwest::header::{ACCEPT, CACHE_CONTROL, USER_AGENT};
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use sha1::{Digest as Sha1Digest, Sha1};
@@ -21,36 +21,15 @@ const MAX_EXTENSION_BYTES: u64 = 100 * 1024 * 1024;
 const MAX_FILE_BYTES: u64 = 25 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
-struct GitHubCommit {
-    sha: String,
-    commit: GitHubCommitBody,
-}
-
-#[derive(Debug, Deserialize)]
-struct GitHubCommitBody {
-    tree: GitHubTreePointer,
-}
-
-#[derive(Debug, Deserialize)]
-struct GitHubTreePointer {
-    sha: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct GitHubTree {
-    tree: Vec<GitHubTreeItem>,
-    truncated: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct GitHubTreeItem {
+struct GitHubContentItem {
+    name: String,
     path: String,
-    mode: String,
     #[serde(rename = "type")]
     kind: String,
     sha: String,
     #[serde(default)]
     size: u64,
+    submodule_git_url: Option<String>,
 }
 
 pub struct RepositoryClient {
@@ -114,69 +93,10 @@ impl RepositoryClient {
     ) -> Result<(), String> {
         refresh_local_integrity(paths, state, repair_id)?;
 
-        let endpoint = format!(
-            "{}/repos/{}/commits/{}",
-            self.api_base, self.config.repository, self.config.branch
-        );
-        let mut request = self
-            .client
-            .get(endpoint)
-            .header(ACCEPT, "application/vnd.github+json")
-            .header(USER_AGENT, "NoX-Extension-Manager")
-            .header("X-GitHub-Api-Version", "2022-11-28");
-        if let Some(etag) = state
-            .etag
-            .as_ref()
-            .filter(|_| state.commit_sha.is_some() && state.tree_sha.is_some())
-        {
-            request = request.header(IF_NONE_MATCH, etag);
-        }
-
-        let response = request
-            .send()
-            .await
-            .map_err(|error| format!("Could not reach GitHub: {error}"))?;
-        let not_modified = response.status() == StatusCode::NOT_MODIFIED;
-        if !not_modified && !response.status().is_success() {
-            return Err(format!(
-                "GitHub returned {} while checking the extension repository",
-                response.status()
-            ));
-        }
-
-        let etag = response
-            .headers()
-            .get(ETAG)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned)
-            .or_else(|| not_modified.then(|| state.etag.clone()).flatten());
-        let commit: GitHubCommit = if not_modified {
-            GitHubCommit {
-                sha: state
-                    .commit_sha
-                    .clone()
-                    .ok_or("Cached commit is missing; sync again")?,
-                commit: GitHubCommitBody {
-                    tree: GitHubTreePointer {
-                        sha: state
-                            .tree_sha
-                            .clone()
-                            .ok_or("Cached tree is missing; sync again")?,
-                    },
-                },
-            }
-        } else {
-            response
-                .json()
-                .await
-                .map_err(|error| format!("GitHub returned invalid commit metadata: {error}"))?
-        };
-        // A cached commit is not proof that local discovery/downloads are complete.
-        // Always reconcile the tree, including after a conditional 304 response.
-        let tree = self.fetch_tree(&commit.commit.tree.sha).await?;
-        let discovered = discover_extensions(&self.config.extensions_path, tree.tree)?;
+        let directory = self.fetch_directory(&self.config.extensions_path).await?;
+        let discovered = discover_extensions(&self.config.extensions_path, directory)?;
         if let Some(id) = repair_id {
-            if !discovered.contains_key(id) {
+            if !discovered.contains(id) {
                 return Err(format!(
                     "{id} is no longer available in the repository; repair blocked"
                 ));
@@ -189,20 +109,12 @@ impl RepositoryClient {
             }
         }
 
-        for (id, files) in discovered {
+        for id in discovered {
             if repair_id.is_some_and(|target| target != id) {
                 continue;
             }
             if let Err(error) = self
-                .sync_extension(
-                    paths,
-                    state,
-                    chrome,
-                    &commit.sha,
-                    &id,
-                    files,
-                    repair_id == Some(id.as_str()),
-                )
+                .sync_extension(paths, state, chrome, &id, repair_id == Some(id.as_str()))
                 .await
             {
                 paths.log(&format!("Could not synchronize {id}: {error}"));
@@ -221,41 +133,88 @@ impl RepositoryClient {
             }
         }
 
-        state.etag = etag;
-        state.tree_sha = Some(commit.commit.tree.sha);
-        state.commit_sha = Some(commit.sha);
         state.last_synced_at = Some(Utc::now().to_rfc3339());
         paths.save_repository_state(state)
     }
 
-    async fn fetch_tree(&self, tree_sha: &str) -> Result<GitHubTree, String> {
-        let endpoint = format!(
-            "{}/repos/{}/git/trees/{}?recursive=1",
-            self.api_base, self.config.repository, tree_sha
-        );
+    async fn fetch_directory(&self, directory: &str) -> Result<Vec<GitHubContentItem>, String> {
+        let mut url = Url::parse(&self.api_base)
+            .map_err(|error| format!("Could not construct the GitHub contents URL: {error}"))?;
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| "Could not build the GitHub contents URL".to_string())?;
+            segments.push("repos");
+            for segment in self.config.repository.split('/') {
+                segments.push(segment);
+            }
+            segments.push("contents");
+            for component in safe_relative_path(directory)?.components() {
+                if let Component::Normal(segment) = component {
+                    segments.push(&segment.to_string_lossy());
+                }
+            }
+        }
+        url.query_pairs_mut()
+            .append_pair("ref", &self.config.branch);
         let response = self
             .client
-            .get(endpoint)
+            .get(url)
             .header(ACCEPT, "application/vnd.github+json")
             .header(USER_AGENT, "NoX-Extension-Manager")
+            .header(CACHE_CONTROL, "no-cache")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .send()
             .await
-            .map_err(|error| format!("Could not read the GitHub tree: {error}"))?;
+            .map_err(|error| format!("Could not read {directory} from GitHub: {error}"))?;
         if !response.status().is_success() {
             return Err(format!(
-                "GitHub tree request failed with {}",
+                "GitHub returned {} while listing {directory}",
                 response.status()
             ));
         }
-        let tree: GitHubTree = response
-            .json()
-            .await
-            .map_err(|error| format!("GitHub returned an invalid tree: {error}"))?;
-        if tree.truncated {
-            return Err("The GitHub extension tree is too large and was truncated".into());
+        let items: Vec<GitHubContentItem> = response.json().await.map_err(|error| {
+            format!("GitHub returned an invalid directory listing for {directory}: {error}")
+        })?;
+        if items.len() >= 1_000 {
+            return Err(format!(
+                "{directory} reached GitHub's directory listing limit"
+            ));
         }
-        Ok(tree)
+        Ok(items)
+    }
+
+    async fn extension_files(&self, id: &str) -> Result<Vec<RemoteFile>, String> {
+        let root = format!("{}/{}", self.config.extensions_path.trim_matches('/'), id);
+        let prefix = format!("{root}/");
+        let mut directories = vec![root];
+        let mut files = Vec::new();
+        while let Some(directory) = directories.pop() {
+            for item in self.fetch_directory(&directory).await? {
+                if item.submodule_git_url.is_some() {
+                    continue;
+                }
+                let expected_path = format!("{directory}/{}", item.name);
+                if item.path != expected_path || item.name.contains(['/', '\\']) {
+                    return Err(format!("Unexpected extension file path: {}", item.path));
+                }
+                let relative = item.path.strip_prefix(&prefix).ok_or_else(|| {
+                    format!("File is outside the extension directory: {}", item.path)
+                })?;
+                safe_relative_path(relative)?;
+                match item.kind.as_str() {
+                    "dir" => directories.push(item.path),
+                    "file" => files.push(RemoteFile {
+                        path: relative.to_string(),
+                        oid: item.sha,
+                        size: item.size,
+                    }),
+                    _ => {} // Symlinks and submodules are never downloaded.
+                }
+            }
+        }
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(files)
     }
 
     async fn sync_extension(
@@ -263,39 +222,39 @@ impl RepositoryClient {
         paths: &StoragePaths,
         state: &mut RepositoryState,
         chrome: &ChromeState,
-        commit_sha: &str,
         id: &str,
-        files: Vec<RemoteFile>,
         restore_local: bool,
     ) -> Result<(), String> {
         validate_id(id)?;
-        let manifest_file = files
-            .iter()
-            .find(|file| file.path == "manifest.json")
-            .ok_or_else(|| format!("{id} does not contain manifest.json at its root"))?;
-        let manifest_bytes = self.fetch_raw_file(commit_sha, id, manifest_file).await?;
-        verify_git_oid(&manifest_bytes, &manifest_file.oid)?;
+        // Read each manifest on every sync. Extension versions, not changes
+        // elsewhere in the repository, decide whether an update is available.
+        let cache_key = Utc::now()
+            .timestamp_nanos_opt()
+            .unwrap_or_default()
+            .to_string();
+        let Some(manifest_bytes) = self.fetch_raw_file(id, "manifest.json", &cache_key).await?
+        else {
+            if restore_local {
+                return Err(format!(
+                    "{id}/manifest.json is no longer available; repair blocked"
+                ));
+            }
+            return Ok(()); // A directory without a root manifest is not an extension.
+        };
         let manifest: ChromeManifest = serde_json::from_slice(&manifest_bytes)
             .map_err(|error| format!("{id}/manifest.json is invalid: {error}"))?;
         validate_manifest(id, &manifest)?;
-
         let existing = state.extensions.get(id).cloned();
-        let changed = existing
+        let version_order = existing
             .as_ref()
-            .map(|entry| entry.remote_files != files)
-            .unwrap_or(true);
-
-        if let Some(previous) = &existing {
-            if changed
-                && !previous.remote_version.is_empty()
-                && compare_versions(&manifest.version, &previous.remote_version)?
-                    != Ordering::Greater
-            {
-                return Err(format!(
-                    "Remote files changed but manifest version {} is not newer than {}",
-                    manifest.version, previous.remote_version
-                ));
-            }
+            .filter(|entry| !entry.remote_version.is_empty())
+            .map(|entry| compare_versions(&manifest.version, &entry.remote_version))
+            .transpose()?;
+        if version_order == Some(Ordering::Less) {
+            return Err(format!(
+                "Repository version {} is older than the last downloaded version",
+                manifest.version
+            ));
         }
 
         let active_missing = !paths.extension_dir(id).exists();
@@ -305,7 +264,11 @@ impl RepositoryClient {
                 .as_ref()
                 .is_some_and(|version| !paths.pending_dir(id, version).is_dir())
         });
-        if !changed && !active_missing && !pending_missing && !restore_local {
+        if version_order == Some(Ordering::Equal)
+            && !active_missing
+            && !pending_missing
+            && !restore_local
+        {
             let preferred_icon = manifest.preferred_icon();
             let entry = state.extensions.get_mut(id).expect("existing entry");
             entry.available = true;
@@ -333,8 +296,17 @@ impl RepositoryClient {
             }
         }
 
+        let files = self.extension_files(id).await?;
+        let manifest_file = files
+            .iter()
+            .find(|file| file.path == "manifest.json")
+            .ok_or_else(|| {
+                format!("{id}/manifest.json disappeared while downloading; sync again")
+            })?;
+        verify_git_oid(&manifest_bytes, &manifest_file.oid)?;
+
         let (downloaded_dir, hashes) = self
-            .download_extension(paths, commit_sha, id, &files, &manifest_bytes)
+            .download_extension(paths, id, &files, &manifest_bytes)
             .await?;
         let destination = paths.extension_dir(id);
         let unmanaged = existing
@@ -413,7 +385,6 @@ impl RepositoryClient {
     async fn download_extension(
         &self,
         paths: &StoragePaths,
-        commit_sha: &str,
         id: &str,
         files: &[RemoteFile],
         manifest_bytes: &[u8],
@@ -440,7 +411,14 @@ impl RepositoryClient {
                 let bytes = if file.path == "manifest.json" {
                     manifest_bytes.to_vec()
                 } else {
-                    self.fetch_raw_file(commit_sha, id, file).await?
+                    self.fetch_raw_file(id, &file.path, &file.oid)
+                        .await?
+                        .ok_or_else(|| {
+                            format!(
+                                "{id}/{} disappeared while downloading; sync again",
+                                file.path
+                            )
+                        })?
                 };
                 verify_git_oid(&bytes, &file.oid)?;
                 let destination = staging.join(&relative);
@@ -469,10 +447,10 @@ impl RepositoryClient {
 
     async fn fetch_raw_file(
         &self,
-        commit_sha: &str,
         id: &str,
-        file: &RemoteFile,
-    ) -> Result<Vec<u8>, String> {
+        relative: &str,
+        cache_key: &str,
+    ) -> Result<Option<Vec<u8>>, String> {
         let mut url = Url::parse(&self.raw_base)
             .map_err(|error| format!("Could not construct raw GitHub URL: {error}"))?;
         {
@@ -482,34 +460,47 @@ impl RepositoryClient {
             for segment in self.config.repository.split('/') {
                 segments.push(segment);
             }
-            segments.push(commit_sha);
-            segments.push(&self.config.extensions_path);
+            segments.push(&self.config.branch);
+            for component in safe_relative_path(&self.config.extensions_path)?.components() {
+                if let Component::Normal(segment) = component {
+                    segments.push(&segment.to_string_lossy());
+                }
+            }
             segments.push(id);
-            for component in safe_relative_path(&file.path)?.components() {
+            for component in safe_relative_path(relative)?.components() {
                 if let Component::Normal(segment) = component {
                     segments.push(&segment.to_string_lossy());
                 }
             }
         }
+        // A fresh key for manifests avoids stale branch responses; file hashes
+        // provide stable keys for downloads without consulting commit metadata.
+        url.query_pairs_mut().append_pair("nox", cache_key);
         let response = self
             .client
             .get(url)
             .header(USER_AGENT, "NoX-Extension-Manager")
+            .header(CACHE_CONTROL, "no-cache")
             .send()
             .await
-            .map_err(|error| format!("Could not download {id}/{}: {error}", file.path))?;
+            .map_err(|error| format!("Could not download {id}/{relative}: {error}"))?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
         if !response.status().is_success() {
             return Err(format!(
-                "GitHub returned {} for {id}/{}",
-                response.status(),
-                file.path
+                "GitHub returned {} for {id}/{relative}",
+                response.status()
             ));
         }
-        Ok(response
+        let bytes = response
             .bytes()
             .await
-            .map_err(|error| format!("Could not read {id}/{}: {error}", file.path))?
-            .to_vec())
+            .map_err(|error| format!("Could not read {id}/{relative}: {error}"))?;
+        if bytes.len() as u64 > MAX_FILE_BYTES {
+            return Err(format!("{id}/{relative} exceeds the 25 MB file limit"));
+        }
+        Ok(Some(bytes.to_vec()))
     }
 }
 
@@ -579,38 +570,24 @@ pub fn build_snapshot(
 
 fn discover_extensions(
     extensions_path: &str,
-    items: Vec<GitHubTreeItem>,
-) -> Result<BTreeMap<String, Vec<RemoteFile>>, String> {
+    items: Vec<GitHubContentItem>,
+) -> Result<BTreeSet<String>, String> {
     let prefix = format!("{}/", extensions_path.trim_matches('/'));
-    let mut grouped: BTreeMap<String, Vec<RemoteFile>> = BTreeMap::new();
-    let mut manifests = BTreeSet::new();
-
+    let mut directories = BTreeSet::new();
     for item in items {
-        if item.kind != "blob" || item.mode == "120000" {
+        if item.kind != "dir" || item.submodule_git_url.is_some() {
             continue;
         }
-        let Some(remainder) = item.path.strip_prefix(&prefix) else {
+        let Some(id) = item.path.strip_prefix(&prefix) else {
             continue;
         };
-        let Some((id, relative)) = remainder.split_once('/') else {
+        if id != item.name || id.contains(['/', '\\']) {
             continue;
-        };
+        }
         validate_id(id)?;
-        safe_relative_path(relative)?;
-        if relative == "manifest.json" {
-            manifests.insert(id.to_string());
-        }
-        grouped.entry(id.to_string()).or_default().push(RemoteFile {
-            path: relative.to_string(),
-            oid: item.sha,
-            size: item.size,
-        });
+        directories.insert(id.to_string());
     }
-    grouped.retain(|id, _| manifests.contains(id));
-    for files in grouped.values_mut() {
-        files.sort_by(|left, right| left.path.cmp(&right.path));
-    }
-    Ok(grouped)
+    Ok(directories)
 }
 
 pub fn compare_versions(left: &str, right: &str) -> Result<Ordering, String> {
@@ -691,7 +668,7 @@ fn verify_git_oid(bytes: &[u8], expected: &str) -> Result<(), String> {
         _ => return Err("GitHub returned an unsupported object hash".into()),
     };
     if actual != expected {
-        return Err("Downloaded file hash does not match the GitHub tree".into());
+        return Err("Downloaded file hash does not match the GitHub directory listing".into());
     }
     Ok(())
 }
@@ -825,13 +802,14 @@ pub fn replace_directory(source: &Path, destination: &Path, backups: &Path) -> R
 mod tests {
     use super::*;
 
-    fn tree_file(path: &str, oid: &str) -> GitHubTreeItem {
-        GitHubTreeItem {
+    fn content_item(name: &str, path: &str, kind: &str) -> GitHubContentItem {
+        GitHubContentItem {
+            name: name.into(),
             path: path.into(),
-            mode: "100644".into(),
-            kind: "blob".into(),
-            sha: oid.into(),
+            kind: kind.into(),
+            sha: "file-hash".into(),
             size: 10,
+            submodule_git_url: None,
         }
     }
 
@@ -864,16 +842,15 @@ mod tests {
     }
 
     #[test]
-    fn discovery_uses_only_immediate_extension_manifests() {
-        let tree = vec![
-            tree_file("extensions/First/manifest.json", "one"),
-            tree_file("extensions/First/content.js", "two"),
-            tree_file("extensions/group/Nested/manifest.json", "three"),
-            tree_file("extensions/README.md", "four"),
+    fn discovery_lists_only_immediate_extension_directories() {
+        let items = vec![
+            content_item("First", "extensions/First", "dir"),
+            content_item("Nested", "extensions/group/Nested", "dir"),
+            content_item("README.md", "extensions/README.md", "file"),
+            content_item("Link", "extensions/Link", "symlink"),
         ];
-        let discovered = discover_extensions("extensions", tree).unwrap();
-        assert_eq!(discovered.keys().cloned().collect::<Vec<_>>(), ["First"]);
-        assert_eq!(discovered["First"].len(), 2);
+        let discovered = discover_extensions("extensions", items).unwrap();
+        assert_eq!(discovered.into_iter().collect::<Vec<_>>(), ["First"]);
     }
 
     #[test]

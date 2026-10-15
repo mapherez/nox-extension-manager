@@ -39,10 +39,6 @@ pub struct ManagedExtension {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RepositoryState {
-    pub etag: Option<String>,
-    pub commit_sha: Option<String>,
-    #[serde(default)]
-    pub tree_sha: Option<String>,
     pub last_synced_at: Option<String>,
     pub extensions: BTreeMap<String, ManagedExtension>,
 }

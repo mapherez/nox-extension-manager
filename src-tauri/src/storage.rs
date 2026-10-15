@@ -157,14 +157,18 @@ mod tests {
         assert!(paths.repository_state.exists());
 
         let state = RepositoryState {
-            commit_sha: Some("abc123".into()),
+            last_synced_at: Some("2026-10-15T15:00:00Z".into()),
             ..RepositoryState::default()
         };
         paths.save_repository_state(&state).unwrap();
 
         assert_eq!(
-            paths.load_repository_state().unwrap().commit_sha.as_deref(),
-            Some("abc123")
+            paths
+                .load_repository_state()
+                .unwrap()
+                .last_synced_at
+                .as_deref(),
+            Some("2026-10-15T15:00:00Z")
         );
         assert!(!paths.repository_state.with_extension("json.tmp").exists());
     }

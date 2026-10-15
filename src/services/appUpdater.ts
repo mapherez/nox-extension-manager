@@ -18,7 +18,7 @@ export type UpdateProgress = {
 
 export async function checkForAppUpdate(): Promise<AppUpdateInfo | null> {
   if (!isTauri()) return null;
-  const update = await check();
+  const update = await check({ headers: { 'Cache-Control': 'no-cache' } });
   if (!update) return null;
   return {
     currentVersion: update.currentVersion || (await getVersion()),

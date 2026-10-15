@@ -16,8 +16,7 @@ struct RepositoryServer {
     url: String,
     stop: Arc<AtomicBool>,
     fail_download: Arc<AtomicBool>,
-    not_modified: Arc<AtomicUsize>,
-    trees: Arc<AtomicUsize>,
+    directory_requests: Arc<AtomicUsize>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
@@ -28,13 +27,11 @@ impl RepositoryServer {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let stop = Arc::new(AtomicBool::new(false));
         let fail_download = Arc::new(AtomicBool::new(false));
-        let not_modified = Arc::new(AtomicUsize::new(0));
-        let trees = Arc::new(AtomicUsize::new(0));
-        let (done, fail, cached, tree_requests) = (
+        let directory_requests = Arc::new(AtomicUsize::new(0));
+        let (done, fail, listing_requests) = (
             stop.clone(),
             fail_download.clone(),
-            not_modified.clone(),
-            trees.clone(),
+            directory_requests.clone(),
         );
         let worker = thread::spawn(move || {
             while !done.load(AtomicOrdering::SeqCst) {
@@ -61,28 +58,35 @@ impl RepositoryServer {
                     request.extend_from_slice(&buffer[..count]);
                 }
                 let request = String::from_utf8(request).unwrap();
-                let path = request.split_whitespace().nth(1).unwrap_or_default();
-                let (status, body) = if path.ends_with("/commits/master") {
-                    if request.to_lowercase().contains("if-none-match: \"same\"") {
-                        cached.fetch_add(1, AtomicOrdering::SeqCst);
-                        (304, Vec::new())
-                    } else {
-                        (
-                            200,
-                            br#"{"sha":"commit","commit":{"tree":{"sha":"tree"}}}"#.to_vec(),
-                        )
-                    }
-                } else if path.contains("/git/trees/tree?recursive=1") {
-                    tree_requests.fetch_add(1, AtomicOrdering::SeqCst);
-                    let files: Vec<_> = [("manifest.json", MANIFEST), ("content.js", SCRIPT)].iter().map(|(path, bytes)| {
-                        serde_json::json!({"path": format!("extensions/{ID}/{path}"), "type":"blob", "mode":"100644", "sha": blob_oid(bytes), "size":bytes.len()})
-                    }).collect();
+                let path = request
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .split('?')
+                    .next()
+                    .unwrap_or_default();
+                let (status, body) = if path == "/repos/owner/repo/contents/extensions" {
+                    listing_requests.fetch_add(1, AtomicOrdering::SeqCst);
                     (
                         200,
-                        serde_json::json!({"tree": files,"truncated":false})
-                            .to_string()
-                            .into_bytes(),
+                        serde_json::json!([{
+                            "name": ID, "path": format!("extensions/{ID}"),
+                            "type": "dir", "sha": "directory", "size": 0,
+                        }])
+                        .to_string()
+                        .into_bytes(),
                     )
+                } else if path == format!("/repos/owner/repo/contents/extensions/{ID}") {
+                    let files: Vec<_> = [("manifest.json", MANIFEST), ("content.js", SCRIPT)]
+                        .iter()
+                        .map(|(name, bytes)| {
+                            serde_json::json!({
+                                "name": name, "path": format!("extensions/{ID}/{name}"),
+                                "type": "file", "sha": blob_oid(bytes), "size": bytes.len(),
+                            })
+                        })
+                        .collect();
+                    (200, serde_json::to_vec(&files).unwrap())
                 } else if path.ends_with("/manifest.json") {
                     (200, MANIFEST.to_vec())
                 } else if path.ends_with("/content.js") && fail.swap(false, AtomicOrdering::SeqCst)
@@ -93,7 +97,12 @@ impl RepositoryServer {
                 } else {
                     (404, b"unknown route".to_vec())
                 };
-                write!(stream, "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nETag: \"same\"\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
                 stream.write_all(&body).unwrap();
             }
         });
@@ -101,8 +110,7 @@ impl RepositoryServer {
             url,
             stop,
             fail_download,
-            not_modified,
-            trees,
+            directory_requests,
             worker: Some(worker),
         }
     }
@@ -151,7 +159,7 @@ fn runtime() -> tokio::runtime::Runtime {
 }
 
 #[test]
-fn conditional_304_rediscovers_missing_entries_and_adopts_identical_downloads() {
+fn sync_rediscovers_missing_entries_and_adopts_identical_downloads() {
     let server = RepositoryServer::start();
     let temp = tempfile::tempdir().unwrap();
     let paths = StoragePaths::from_root(temp.path().join("extensions"));
@@ -169,8 +177,7 @@ fn conditional_304_rediscovers_missing_entries_and_adopts_identical_downloads() 
             .await
             .unwrap();
     });
-    assert_eq!(server.not_modified.load(AtomicOrdering::SeqCst), 1);
-    assert_eq!(server.trees.load(AtomicOrdering::SeqCst), 2);
+    assert_eq!(server.directory_requests.load(AtomicOrdering::SeqCst), 2);
     assert!(state.extensions[ID].problem.is_none());
     assert_eq!(
         state.extensions[ID].active_version.as_deref(),
@@ -183,7 +190,7 @@ fn conditional_304_rediscovers_missing_entries_and_adopts_identical_downloads() 
 }
 
 #[test]
-fn conditional_304_restores_a_deleted_installed_directory_and_prepares_reload() {
+fn sync_restores_a_deleted_installed_directory_and_prepares_reload() {
     let server = RepositoryServer::start();
     let temp = tempfile::tempdir().unwrap();
     let paths = StoragePaths::from_root(temp.path().join("extensions"));
@@ -224,7 +231,7 @@ fn conditional_304_restores_a_deleted_installed_directory_and_prepares_reload() 
 }
 
 #[test]
-fn conditional_304_retries_failed_downloads() {
+fn sync_retries_failed_downloads() {
     let server = RepositoryServer::start();
     server.fail_download.store(true, AtomicOrdering::SeqCst);
     let temp = tempfile::tempdir().unwrap();
@@ -243,7 +250,7 @@ fn conditional_304_retries_failed_downloads() {
             .await
             .unwrap();
     });
-    assert_eq!(server.not_modified.load(AtomicOrdering::SeqCst), 1);
+    assert_eq!(server.directory_requests.load(AtomicOrdering::SeqCst), 2);
     assert!(state.extensions[ID].problem.is_none());
     assert!(paths.extension_dir(ID).join("manifest.json").is_file());
 }
