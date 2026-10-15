@@ -45,7 +45,7 @@ export const useManagerStore = create<ManagerStore>((set, get) => ({
     await get().sync();
   },
   sync: async () => {
-    if (get().syncing) return;
+    if (get().syncing || get().activeExtensionId) return;
     set({ syncing: true, syncError: null });
     try {
       set({ snapshot: await syncExtensions(), syncing: false });
@@ -58,7 +58,7 @@ export const useManagerStore = create<ManagerStore>((set, get) => ({
     }
   },
   runAction: async (action, id) => {
-    if (get().activeExtensionId) return;
+    if (get().activeExtensionId || get().syncing) return;
     set({ activeExtensionId: id, error: null, notice: null });
     try {
       const result = await runExtensionAction(action, id);

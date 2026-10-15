@@ -36,7 +36,7 @@ function App() {
   const clearNotice = useManagerStore((state) => state.clearNotice);
   const checkAppUpdate = useAppUpdaterStore((state) => state.check);
   const [query, setQuery] = useState('');
-  const [removeTarget, setRemoveTarget] = useState<ExtensionView | null>(null);
+  const [confirmTarget, setConfirmTarget] = useState<{ extension: ExtensionView; action: 'remove' | 'repair' } | null>(null);
 
   useEffect(() => { void initialize(); void checkAppUpdate(true); }, [checkAppUpdate, initialize]);
   useEffect(() => {
@@ -52,7 +52,14 @@ function App() {
       `${extension.name} ${extension.description} ${extension.id}`.toLowerCase().includes(normalized));
   }, [query, snapshot?.extensions]);
 
-  const act = (action: ExtensionAction, id: string) => { void runAction(action, id); };
+  const act = (action: ExtensionAction, id: string) => {
+    if (action === 'repair') {
+      const extension = snapshot?.extensions.find((entry) => entry.id === id);
+      if (extension) setConfirmTarget({ extension, action });
+      return;
+    }
+    void runAction(action, id);
+  };
 
   return (
     <div className={`app-shell platform-${__NOX_PLATFORM__}`}>
@@ -62,7 +69,7 @@ function App() {
         <header className="page-header">
           <div><p className="eyebrow">LOCAL CHROME LIBRARY</p><h1>Extensions</h1></div>
           <div className="sync-cluster">
-            <button className="button button-secondary sync-button" onClick={() => void sync()} disabled={syncing}>
+            <button className="button button-secondary sync-button" onClick={() => void sync()} disabled={syncing || Boolean(activeExtensionId)}>
               <RefreshCw size={19} className={syncing ? 'spin' : undefined} />
               {syncing ? 'Syncing…' : 'Sync extensions'}
             </button>
@@ -87,13 +94,13 @@ function App() {
             <ExtensionCard key={extension.id} extension={extension} index={index}
               busy={activeExtensionId === extension.id} downloading={syncing}
               disabled={syncing || Boolean(activeExtensionId && activeExtensionId !== extension.id)}
-              onAction={act} onRemove={() => setRemoveTarget(extension)} />
+              onAction={act} onRemove={() => setConfirmTarget({ extension, action: 'remove' })} />
           ))}
         </section>
       </main>
       <AppFooter />
-      {removeTarget ? <ConfirmDialog extension={removeTarget} onCancel={() => setRemoveTarget(null)}
-        onConfirm={() => { act('remove', removeTarget.id); setRemoveTarget(null); }} /> : null}
+      {confirmTarget ? <ConfirmDialog extension={confirmTarget.extension} action={confirmTarget.action} onCancel={() => setConfirmTarget(null)}
+        onConfirm={() => { void runAction(confirmTarget.action, confirmTarget.extension.id); setConfirmTarget(null); }} /> : null}
       {error ? <ErrorDialog message={error} repositoryUrl={snapshot?.repositoryUrl}
         repairId={retryOperation && retryOperation.action !== 'sync' && retryOperation.action !== 'install'
           ? retryOperation.id : null}
@@ -136,6 +143,9 @@ export function ExtensionCard({ extension, index, busy, downloading, disabled, o
     </div>
     <div className={`status-pill pill-${displayStatus}`}><StatusIcon status={displayStatus} />{statusCopy[displayStatus]}</div>
     <div className="card-actions">
+      {['installed', 'locallyModified', 'error'].includes(extension.status) ? <button className="button button-secondary"
+        disabled={busy || disabled} aria-label={`Restore and repair ${extension.name}`}
+        onClick={() => onAction('repair', extension.id)}><RotateCcw size={18} /> Restore &amp; repair</button> : null}
       {extension.status === 'readyToInstall' ? <button className="button button-primary" disabled={busy || disabled}
         onClick={() => onAction('install', extension.id)}>{busy ? <RefreshCw className="spin" size={18} /> : <Download size={18} />} Install</button> : null}
       {extension.status === 'updateReady' ? <button className="button button-primary" disabled={busy || disabled}
@@ -203,7 +213,8 @@ function AppFooter() {
   </footer>;
 }
 
-function ConfirmDialog({ extension, onCancel, onConfirm }: { extension: ExtensionView; onCancel: () => void; onConfirm: () => void }) {
+export function ConfirmDialog({ extension, action, onCancel, onConfirm }: { extension: ExtensionView; action: 'remove' | 'repair'; onCancel: () => void; onConfirm: () => void }) {
+  const repair = action === 'repair';
   const cancelButton = useRef<HTMLButtonElement>(null);
   useEffect(() => {
     cancelButton.current?.focus();
@@ -213,10 +224,11 @@ function ConfirmDialog({ extension, onCancel, onConfirm }: { extension: Extensio
   }, [onCancel]);
   return <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onCancel()}>
     <section className="dialog" role="alertdialog" aria-modal="true" aria-labelledby="remove-title">
-      <div className="dialog-icon danger"><Trash2 size={22} /></div><h2 id="remove-title">Remove {extension.name} from Chrome?</h2>
-      <p>The local files will stay in Documents, ready to install again.</p>
+      <div className="dialog-icon danger">{repair ? <RotateCcw size={22} /> : <Trash2 size={22} />}</div>
+      <h2 id="remove-title">{repair ? `Restore and repair ${extension.name}?` : `Remove ${extension.name} from Chrome?`}</h2>
+      <p>{repair ? 'The repository version will replace this extension’s local files. A backup of the current files will be kept in .nox/backups. Only this extension will be reconnected in Chrome.' : 'The local files will stay in Documents, ready to install again.'}</p>
       <div className="dialog-actions"><button ref={cancelButton} className="button button-secondary" onClick={onCancel}>Cancel</button>
-        <button className="button button-danger-solid" onClick={onConfirm}>Remove</button></div>
+        <button className="button button-danger-solid" onClick={onConfirm}>{repair ? 'Restore & repair' : 'Remove'}</button></div>
     </section></div>;
 }
 

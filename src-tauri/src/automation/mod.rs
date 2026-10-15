@@ -3,9 +3,22 @@ use std::path::Path;
 pub trait BrowserAutomationBackend: Send + Sync {
     fn preflight(&self) -> Result<(), String>;
     fn install(&self, extension_path: &Path, expected_version: &str) -> Result<String, String>;
-    fn reload(&self, chrome_extension_id: &str, expected_version: &str) -> Result<(), String>;
-    fn remove(&self, chrome_extension_id: &str) -> Result<(), String>;
+    fn verify_identity(
+        &self,
+        extension_path: &Path,
+        chrome_extension_id: &str,
+    ) -> Result<(), String>;
+    fn reload(
+        &self,
+        extension_path: &Path,
+        chrome_extension_id: &str,
+        expected_version: &str,
+    ) -> Result<(), String>;
+    fn remove(&self, extension_path: &Path, chrome_extension_id: &str) -> Result<(), String>;
 }
+
+#[cfg(any(target_os = "windows", target_os = "macos", test))]
+mod registration;
 
 #[cfg(target_os = "windows")]
 mod windows;
@@ -33,11 +46,15 @@ impl BrowserAutomationBackend for UnsupportedAutomation {
         unreachable!()
     }
 
-    fn reload(&self, _: &str, _: &str) -> Result<(), String> {
+    fn verify_identity(&self, _: &Path, _: &str) -> Result<(), String> {
         self.preflight()
     }
 
-    fn remove(&self, _: &str) -> Result<(), String> {
+    fn reload(&self, _: &Path, _: &str, _: &str) -> Result<(), String> {
+        self.preflight()
+    }
+
+    fn remove(&self, _: &Path, _: &str) -> Result<(), String> {
         self.preflight()
     }
 }

@@ -56,6 +56,8 @@ struct GitHubTreeItem {
 pub struct RepositoryClient {
     config: RepositoryConfig,
     client: Client,
+    api_base: String,
+    raw_base: String,
 }
 
 impl RepositoryClient {
@@ -64,7 +66,12 @@ impl RepositoryClient {
             .https_only(true)
             .build()
             .map_err(|error| format!("Could not initialize the GitHub client: {error}"))?;
-        Ok(Self { config, client })
+        Ok(Self {
+            config,
+            client,
+            api_base: "https://api.github.com".into(),
+            raw_base: "https://raw.githubusercontent.com".into(),
+        })
     }
 
     pub fn repository_url(&self) -> &str {
@@ -77,11 +84,39 @@ impl RepositoryClient {
         state: &mut RepositoryState,
         chrome: &ChromeState,
     ) -> Result<(), String> {
-        refresh_local_integrity(paths, state)?;
+        self.sync_inner(paths, state, chrome, None).await
+    }
+
+    pub async fn restore_files(
+        &self,
+        paths: &StoragePaths,
+        state: &mut RepositoryState,
+        chrome: &ChromeState,
+        id: &str,
+    ) -> Result<(), String> {
+        self.sync_inner(paths, state, chrome, Some(id)).await?;
+        let entry = state
+            .extensions
+            .get(id)
+            .ok_or_else(|| format!("Unknown extension: {id}"))?;
+        if let Some(problem) = &entry.problem {
+            return Err(problem.clone());
+        }
+        Ok(())
+    }
+
+    async fn sync_inner(
+        &self,
+        paths: &StoragePaths,
+        state: &mut RepositoryState,
+        chrome: &ChromeState,
+        repair_id: Option<&str>,
+    ) -> Result<(), String> {
+        refresh_local_integrity(paths, state, repair_id)?;
 
         let endpoint = format!(
-            "https://api.github.com/repos/{}/commits/{}",
-            self.config.repository, self.config.branch
+            "{}/repos/{}/commits/{}",
+            self.api_base, self.config.repository, self.config.branch
         );
         let mut request = self
             .client
@@ -89,7 +124,11 @@ impl RepositoryClient {
             .header(ACCEPT, "application/vnd.github+json")
             .header(USER_AGENT, "NoX-Extension-Manager")
             .header("X-GitHub-Api-Version", "2022-11-28");
-        if let Some(etag) = &state.etag {
+        if let Some(etag) = state
+            .etag
+            .as_ref()
+            .filter(|_| state.commit_sha.is_some() && state.tree_sha.is_some())
+        {
             request = request.header(IF_NONE_MATCH, etag);
         }
 
@@ -97,12 +136,8 @@ impl RepositoryClient {
             .send()
             .await
             .map_err(|error| format!("Could not reach GitHub: {error}"))?;
-        if response.status() == StatusCode::NOT_MODIFIED {
-            state.last_synced_at = Some(Utc::now().to_rfc3339());
-            paths.save_repository_state(state)?;
-            return Ok(());
-        }
-        if !response.status().is_success() {
+        let not_modified = response.status() == StatusCode::NOT_MODIFIED;
+        if !not_modified && !response.status().is_success() {
             return Err(format!(
                 "GitHub returned {} while checking the extension repository",
                 response.status()
@@ -113,23 +148,64 @@ impl RepositoryClient {
             .headers()
             .get(ETAG)
             .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-        let commit: GitHubCommit = response
-            .json()
-            .await
-            .map_err(|error| format!("GitHub returned invalid commit metadata: {error}"))?;
+            .map(str::to_owned)
+            .or_else(|| not_modified.then(|| state.etag.clone()).flatten());
+        let commit: GitHubCommit = if not_modified {
+            GitHubCommit {
+                sha: state
+                    .commit_sha
+                    .clone()
+                    .ok_or("Cached commit is missing; sync again")?,
+                commit: GitHubCommitBody {
+                    tree: GitHubTreePointer {
+                        sha: state
+                            .tree_sha
+                            .clone()
+                            .ok_or("Cached tree is missing; sync again")?,
+                    },
+                },
+            }
+        } else {
+            response
+                .json()
+                .await
+                .map_err(|error| format!("GitHub returned invalid commit metadata: {error}"))?
+        };
+        // A cached commit is not proof that local discovery/downloads are complete.
+        // Always reconcile the tree, including after a conditional 304 response.
         let tree = self.fetch_tree(&commit.commit.tree.sha).await?;
         let discovered = discover_extensions(&self.config.extensions_path, tree.tree)?;
+        if let Some(id) = repair_id {
+            if !discovered.contains_key(id) {
+                return Err(format!(
+                    "{id} is no longer available in the repository; repair blocked"
+                ));
+            }
+        }
 
         for extension in state.extensions.values_mut() {
-            extension.available = false;
+            if repair_id.is_none() || repair_id == Some(extension.id.as_str()) {
+                extension.available = false;
+            }
         }
 
         for (id, files) in discovered {
+            if repair_id.is_some_and(|target| target != id) {
+                continue;
+            }
             if let Err(error) = self
-                .sync_extension(paths, state, chrome, &commit.sha, &id, files)
+                .sync_extension(
+                    paths,
+                    state,
+                    chrome,
+                    &commit.sha,
+                    &id,
+                    files,
+                    repair_id == Some(id.as_str()),
+                )
                 .await
             {
+                paths.log(&format!("Could not synchronize {id}: {error}"));
                 let entry =
                     state
                         .extensions
@@ -146,6 +222,7 @@ impl RepositoryClient {
         }
 
         state.etag = etag;
+        state.tree_sha = Some(commit.commit.tree.sha);
         state.commit_sha = Some(commit.sha);
         state.last_synced_at = Some(Utc::now().to_rfc3339());
         paths.save_repository_state(state)
@@ -153,8 +230,8 @@ impl RepositoryClient {
 
     async fn fetch_tree(&self, tree_sha: &str) -> Result<GitHubTree, String> {
         let endpoint = format!(
-            "https://api.github.com/repos/{}/git/trees/{}?recursive=1",
-            self.config.repository, tree_sha
+            "{}/repos/{}/git/trees/{}?recursive=1",
+            self.api_base, self.config.repository, tree_sha
         );
         let response = self
             .client
@@ -189,6 +266,7 @@ impl RepositoryClient {
         commit_sha: &str,
         id: &str,
         files: Vec<RemoteFile>,
+        restore_local: bool,
     ) -> Result<(), String> {
         validate_id(id)?;
         let manifest_file = files
@@ -196,6 +274,7 @@ impl RepositoryClient {
             .find(|file| file.path == "manifest.json")
             .ok_or_else(|| format!("{id} does not contain manifest.json at its root"))?;
         let manifest_bytes = self.fetch_raw_file(commit_sha, id, manifest_file).await?;
+        verify_git_oid(&manifest_bytes, &manifest_file.oid)?;
         let manifest: ChromeManifest = serde_json::from_slice(&manifest_bytes)
             .map_err(|error| format!("{id}/manifest.json is invalid: {error}"))?;
         validate_manifest(id, &manifest)?;
@@ -219,7 +298,14 @@ impl RepositoryClient {
             }
         }
 
-        if !changed {
+        let active_missing = !paths.extension_dir(id).exists();
+        let pending_missing = existing.as_ref().is_some_and(|entry| {
+            entry
+                .pending_version
+                .as_ref()
+                .is_some_and(|version| !paths.pending_dir(id, version).is_dir())
+        });
+        if !changed && !active_missing && !pending_missing && !restore_local {
             let preferred_icon = manifest.preferred_icon();
             let entry = state.extensions.get_mut(id).expect("existing entry");
             entry.available = true;
@@ -237,20 +323,31 @@ impl RepositoryClient {
         }
 
         if let Some(previous) = &existing {
-            if local_files_changed(paths, previous)? {
+            if !restore_local
+                && !previous.active_hashes.is_empty()
+                && local_files_changed(paths, previous)?
+            {
                 return Err(
                     "Local files have changed since the last NoX download; update blocked".into(),
                 );
             }
-        } else if paths.extension_dir(id).exists() {
-            return Err(
-                "Local files already exist but are not managed by NoX; update blocked".into(),
-            );
         }
 
         let (downloaded_dir, hashes) = self
             .download_extension(paths, commit_sha, id, &files, &manifest_bytes)
             .await?;
+        let destination = paths.extension_dir(id);
+        let unmanaged = existing
+            .as_ref()
+            .is_none_or(|entry| entry.active_hashes.is_empty());
+        if !restore_local
+            && unmanaged
+            && destination.exists()
+            && hash_directory(&destination)? != hashes
+        {
+            let _ = fs::remove_dir_all(&downloaded_dir);
+            return Err("Local files already exist and differ from the repository; use Repair to restore them with a backup".into());
+        }
         let installed = chrome.extensions.contains_key(id);
         let mut entry = existing.unwrap_or_else(|| ManagedExtension {
             id: id.to_string(),
@@ -265,18 +362,48 @@ impl RepositoryClient {
         entry.remote_files = files;
         entry.problem = None;
 
-        if installed {
+        if installed && !active_missing && !restore_local {
             let pending = paths.pending_dir(id, &manifest.version);
             replace_directory(&downloaded_dir, &pending, &paths.backups)?;
             entry.pending_version = Some(manifest.version);
             entry.pending_hashes = hashes;
         } else {
-            let destination = paths.extension_dir(id);
-            replace_directory(&downloaded_dir, &destination, &paths.backups)?;
+            if restore_local && destination.exists() {
+                let backup = paths.backup_dir(id).join(format!(
+                    "before-repair-{}",
+                    Utc::now().timestamp_nanos_opt().unwrap_or_default()
+                ));
+                fs::create_dir_all(paths.backup_dir(id)).map_err(|error| error.to_string())?;
+                fs::rename(&destination, &backup).map_err(|error| {
+                    format!("Could not preserve local files before repair: {error}")
+                })?;
+                if let Err(error) = fs::rename(&downloaded_dir, &destination) {
+                    let rollback = fs::rename(&backup, &destination);
+                    return Err(format!("Could not restore repository files: {error}; backup rollback: {rollback:?}"));
+                }
+                paths.log(&format!("Preserved files for {id} at {}", backup.display()));
+            } else {
+                replace_directory(&downloaded_dir, &destination, &paths.backups)?;
+            }
             entry.active_version = Some(manifest.version);
             entry.active_hashes = hashes;
             entry.pending_version = None;
             entry.pending_hashes.clear();
+            if installed && !restore_local {
+                // Restore deleted files immediately, but still require an explicit
+                // Update to reload the registered Chrome extension.
+                let pending = paths.pending_dir(id, &entry.remote_version);
+                let recovered = paths.staging.join(format!(
+                    "recovered-{id}-{}",
+                    Utc::now().timestamp_nanos_opt().unwrap_or_default()
+                ));
+                fs::create_dir_all(&recovered)
+                    .map_err(|error| format!("Could not prepare recovered update: {error}"))?;
+                copy_directory(&destination, &recovered)?;
+                replace_directory(&recovered, &pending, &paths.backups)?;
+                entry.pending_version = Some(entry.remote_version.clone());
+                entry.pending_hashes = entry.active_hashes.clone();
+            }
         }
 
         state.extensions.insert(id.to_string(), entry);
@@ -346,7 +473,7 @@ impl RepositoryClient {
         id: &str,
         file: &RemoteFile,
     ) -> Result<Vec<u8>, String> {
-        let mut url = Url::parse("https://raw.githubusercontent.com")
+        let mut url = Url::parse(&self.raw_base)
             .map_err(|error| format!("Could not construct raw GitHub URL: {error}"))?;
         {
             let mut segments = url
@@ -385,6 +512,10 @@ impl RepositoryClient {
             .to_vec())
     }
 }
+
+#[cfg(test)]
+#[path = "repository_sync_tests.rs"]
+mod sync_tests;
 
 pub fn build_snapshot(
     paths: &StoragePaths,
@@ -574,7 +705,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
 fn local_files_changed(paths: &StoragePaths, entry: &ManagedExtension) -> Result<bool, String> {
     let directory = paths.extension_dir(&entry.id);
     if !directory.exists() {
-        return Ok(!entry.active_hashes.is_empty());
+        // A deleted directory can be downloaded again without overwriting edits.
+        return Ok(false);
     }
     if entry.active_hashes.is_empty() {
         return Ok(true);
@@ -582,11 +714,26 @@ fn local_files_changed(paths: &StoragePaths, entry: &ManagedExtension) -> Result
     Ok(hash_directory(&directory)? != entry.active_hashes)
 }
 
+fn copy_directory(source: &Path, destination: &Path) -> Result<(), String> {
+    for relative in hash_directory(source)?.keys() {
+        let target = destination.join(safe_relative_path(relative)?);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        fs::copy(source.join(relative), target).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 fn refresh_local_integrity(
     paths: &StoragePaths,
     state: &mut RepositoryState,
+    target: Option<&str>,
 ) -> Result<(), String> {
     for entry in state.extensions.values_mut() {
+        if target.is_some_and(|id| id != entry.id) {
+            continue;
+        }
         let changed = local_files_changed(paths, entry)?;
         if changed {
             entry.problem =

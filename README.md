@@ -13,13 +13,16 @@ adapters.
 - Reads only `mapherez/nox-extension-manager`, currently from `master`, and
   pins downloads to the exact commit SHA returned by GitHub.
 - Uses ETag/commit caching, verifies Git object hashes and records SHA-256
-  snapshots of local files.
+  snapshots of local files. Every sync reconciles the extension tree even
+  after a `304 Not Modified`, so missing entries and failed downloads recover.
 - Downloads new extensions immediately. Updates for registered Chrome
   extensions remain staged until the user clicks **Update**.
 - Blocks changed content unless `manifest.json` contains a strictly newer
   version, and blocks updates when active local files were modified.
 - Automates Install, Update, Remove and Repair through Windows UI Automation.
-  No coordinate clicks are used.
+  Chrome's read-only profile registrations must associate the requested
+  directory with the exact Chrome ID before an action can proceed. Controls
+  must belong to that exact extension card; ambiguous controls are rejected.
 - Includes the app updater UI, signed updater artifacts and persistent footer
   status after dismissing the update banner.
 
@@ -45,6 +48,23 @@ Documents/_NoxChromeExtensions/
 Removing an extension removes it from Chrome but retains its downloaded files.
 The application updater only clears the app's local WebView cache; it never
 removes this Documents directory.
+
+### Recovering extensions
+
+Use **Sync extensions** after deleting an extension's download directory. NoX
+downloads it again even if the repository commit has not changed. If NoX's
+repository state was reset, existing directories are accepted only when all
+their file hashes match the repository; differing files are left untouched.
+
+For manual edits or an incorrect saved Chrome registration, choose
+**Restore & repair** on that extension. After confirmation, NoX preserves the
+current files under `.nox/backups/<extension-id>/before-repair-*`, restores the
+repository files, and reconnects Chrome using the directory's actual
+registration. It never removes another extension to repair a registration.
+
+Deleting `.nox` also deletes installation records, integrity snapshots and
+backups. Use Sync or Restore & repair for recovery instead. A failed ownership
+check blocks the action before any Remove or Reload is invoked.
 
 ## Development
 

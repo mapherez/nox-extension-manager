@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ExtensionCard, appUpdateStatus, syncStatus } from './App';
+import { ConfirmDialog, ExtensionCard, appUpdateStatus, syncStatus } from './App';
 import type { ExtensionStatus, ExtensionView } from './types';
 
 afterEach(cleanup);
@@ -60,6 +60,24 @@ describe('extension cards', () => {
     fireEvent.click(screen.getByRole('button', { name: /remove/i }));
     expect(onAction).toHaveBeenCalledWith('update', 'test-extension');
     expect(onRemove).toHaveBeenCalledOnce();
+  });
+
+  it('repairs the selected extension when local files were modified', () => {
+    const { onAction, onRemove } = renderCard('locallyModified');
+    fireEvent.click(screen.getByRole('button', { name: 'Restore and repair Test Extension' }));
+    expect(onAction).toHaveBeenCalledWith('repair', 'test-extension');
+    expect(onRemove).not.toHaveBeenCalled();
+  });
+
+  it('explains replacement and backup before a repair can proceed', () => {
+    const onConfirm = vi.fn();
+    const onCancel = vi.fn();
+    render(<ConfirmDialog extension={extension('locallyModified')} action="repair" onConfirm={onConfirm} onCancel={onCancel} />);
+    expect(screen.getByRole('alertdialog')).toHaveTextContent('A backup of the current files will be kept');
+    expect(onConfirm).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(onCancel).toHaveBeenCalledOnce();
+    expect(onConfirm).not.toHaveBeenCalled();
   });
 });
 

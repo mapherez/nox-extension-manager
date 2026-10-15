@@ -81,7 +81,9 @@ impl ManagerService {
         let automation = Arc::clone(&self.automation);
         let action_version = version.clone();
         let chrome_id = tauri::async_runtime::spawn_blocking(move || {
-            automation.install(&path, &action_version)
+            let chrome_id = automation.install(&path, &action_version)?;
+            automation.verify_identity(&path, &chrome_id)?;
+            Ok::<_, String>(chrome_id)
         })
         .await
         .map_err(|error| format!("Chrome automation task failed: {error}"))??;
@@ -123,6 +125,19 @@ impl ManagerService {
         if !pending.is_dir() {
             return Err("The prepared update directory is missing; sync again".into());
         }
+        if hash_directory(&pending)? != extension.pending_hashes {
+            return Err("The prepared update files have changed; update is blocked".into());
+        }
+        // Validate ownership before even swapping local files. A stale NoX ID
+        // must never reload (or later remove) an unrelated Chrome extension.
+        let automation = Arc::clone(&self.automation);
+        let target = active.clone();
+        let chrome_id = installed.chrome_extension_id.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            automation.verify_identity(&target, &chrome_id)
+        })
+        .await
+        .map_err(|error| format!("Chrome automation task failed: {error}"))??;
 
         let backup_dir = self.paths.backup_dir(id);
         fs::create_dir_all(&backup_dir)
@@ -142,11 +157,12 @@ impl ManagerService {
         let automation = Arc::clone(&self.automation);
         let chrome_id = installed.chrome_extension_id.clone();
         let action_version = pending_version.clone();
+        let action_path = active.clone();
         let action = tauri::async_runtime::spawn_blocking(move || {
-            automation.reload(&chrome_id, &action_version)
+            automation.reload(&action_path, &chrome_id, &action_version)
         })
         .await
-        .map_err(|error| format!("Chrome automation task failed: {error}"))?;
+        .unwrap_or_else(|error| Err(format!("Chrome automation task failed: {error}")));
         if let Err(error) = action {
             if let Some(parent) = pending.parent() {
                 let _ = fs::create_dir_all(parent);
@@ -156,8 +172,9 @@ impl ManagerService {
             let automation = Arc::clone(&self.automation);
             let chrome_id = installed.chrome_extension_id.clone();
             let previous_version = installed.version.clone();
+            let action_path = active.clone();
             let _ = tauri::async_runtime::spawn_blocking(move || {
-                automation.reload(&chrome_id, &previous_version)
+                automation.reload(&action_path, &chrome_id, &previous_version)
             })
             .await;
             self.paths
@@ -197,8 +214,10 @@ impl ManagerService {
             .cloned()
             .ok_or_else(|| format!("{id} is not registered as installed"))?;
         let automation = Arc::clone(&self.automation);
+        let path = self.paths.extension_dir(id);
         tauri::async_runtime::spawn_blocking(move || {
-            automation.remove(&installed.chrome_extension_id)
+            automation.verify_identity(&path, &installed.chrome_extension_id)?;
+            automation.remove(&path, &installed.chrome_extension_id)
         })
         .await
         .map_err(|error| format!("Chrome automation task failed: {error}"))??;
@@ -214,8 +233,11 @@ impl ManagerService {
     }
 
     pub async fn repair(&mut self, id: &str) -> Result<ExtensionActionResult, String> {
-        let repository = self.paths.load_repository_state()?;
+        let mut repository = self.paths.load_repository_state()?;
         let mut chrome = self.paths.load_chrome_state()?;
+        self.repository
+            .restore_files(&self.paths, &mut repository, &chrome, id)
+            .await?;
         let extension = repository
             .extensions
             .get(id)
@@ -228,17 +250,12 @@ impl ManagerService {
         let path = self.paths.extension_dir(id);
         let automation = Arc::clone(&self.automation);
         let action_version = version.clone();
-        let recorded = chrome.extensions.get(id).cloned();
         let chrome_id = tauri::async_runtime::spawn_blocking(move || {
-            if let Some(record) = recorded {
-                if automation
-                    .reload(&record.chrome_extension_id, &action_version)
-                    .is_ok()
-                {
-                    return Ok(record.chrome_extension_id);
-                }
-            }
-            automation.install(&path, &action_version)
+            // Resolve the actual registration by path; never retry a stored ID
+            // which may have belonged to a different extension all along.
+            let chrome_id = automation.install(&path, &action_version)?;
+            automation.verify_identity(&path, &chrome_id)?;
+            Ok::<_, String>(chrome_id)
         })
         .await
         .map_err(|error| format!("Chrome automation task failed: {error}"))??;
@@ -251,7 +268,7 @@ impl ManagerService {
             },
         );
         self.paths.save_chrome_state(&chrome)?;
-        self.result("Chrome installation repaired", &repository, &chrome)
+        self.result("Repository files restored and Chrome installation repaired; previous files were backed up", &repository, &chrome)
     }
 
     fn result(
@@ -300,8 +317,11 @@ fn prune_backups(directory: &std::path::Path, keep: usize) -> Result<(), String>
 
 #[cfg(test)]
 mod tests {
-    use super::prune_backups;
+    use super::*;
+    use crate::model::{ChromeState, ManagedExtension, RepositoryState};
     use std::fs;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn backup_retention_keeps_the_newest_three() {
@@ -316,5 +336,138 @@ mod tests {
             .collect();
         remaining.sort();
         assert_eq!(remaining, ["1.0.0-3", "1.0.0-4", "1.0.0-5"]);
+    }
+
+    struct WrongRegistration {
+        mutations: Arc<AtomicUsize>,
+    }
+
+    impl BrowserAutomationBackend for WrongRegistration {
+        fn preflight(&self) -> Result<(), String> {
+            Ok(())
+        }
+        fn install(&self, _: &Path, _: &str) -> Result<String, String> {
+            Ok("ajopnjidmegmdimjlfnijceegpefgped".into())
+        }
+        fn verify_identity(&self, _: &Path, _: &str) -> Result<(), String> {
+            Err("Chrome ID belongs to BetterTTV, not the requested directory".into())
+        }
+        fn reload(&self, _: &Path, _: &str, _: &str) -> Result<(), String> {
+            self.mutations.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn remove(&self, _: &Path, _: &str) -> Result<(), String> {
+            self.mutations.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn manager_fixture() -> (tempfile::TempDir, ManagerService, Arc<AtomicUsize>) {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StoragePaths::from_root(temp.path().join("managed"));
+        paths.ensure().unwrap();
+        let active = paths.extension_dir("PurgeUndesirables");
+        fs::create_dir(&active).unwrap();
+        fs::write(active.join("content.js"), "active").unwrap();
+        let entry = ManagedExtension {
+            id: "PurgeUndesirables".into(),
+            name: "PurgeUndesirables".into(),
+            active_version: Some("1.0.0".into()),
+            active_hashes: hash_directory(&active).unwrap(),
+            available: true,
+            ..ManagedExtension::default()
+        };
+        paths
+            .save_repository_state(&RepositoryState {
+                extensions: std::collections::BTreeMap::from([(entry.id.clone(), entry)]),
+                ..RepositoryState::default()
+            })
+            .unwrap();
+        let mutations = Arc::new(AtomicUsize::new(0));
+        let repository = RepositoryClient::new(RepositoryConfig {
+            repository: "owner/repo".into(),
+            branch: "master".into(),
+            extensions_path: "extensions".into(),
+            repository_url: "https://github.com/owner/repo".into(),
+        })
+        .unwrap();
+        let manager = ManagerService {
+            paths,
+            repository,
+            automation: Arc::new(WrongRegistration {
+                mutations: mutations.clone(),
+            }),
+        };
+        (temp, manager, mutations)
+    }
+
+    fn register_wrong_id(manager: &ManagerService) {
+        manager
+            .paths
+            .save_chrome_state(&ChromeState {
+                extensions: std::collections::BTreeMap::from([(
+                    "PurgeUndesirables".into(),
+                    ChromeInstallRecord {
+                        chrome_extension_id: "ajopnjidmegmdimjlfnijceegpefgped".into(),
+                        version: "1.0.0".into(),
+                        installed_at: String::new(),
+                    },
+                )]),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn removing_a_stale_id_never_reaches_chrome_or_changes_records() {
+        let (_temp, mut manager, mutations) = manager_fixture();
+        register_wrong_id(&manager);
+        let before = fs::read(&manager.paths.chrome_state).unwrap();
+        let error =
+            tauri::async_runtime::block_on(manager.remove("PurgeUndesirables")).unwrap_err();
+        assert!(error.contains("BetterTTV"));
+        assert_eq!(mutations.load(Ordering::SeqCst), 0);
+        assert_eq!(fs::read(&manager.paths.chrome_state).unwrap(), before);
+    }
+
+    #[test]
+    fn installing_does_not_save_an_id_for_an_unrelated_extension() {
+        let (_temp, mut manager, _) = manager_fixture();
+        assert!(tauri::async_runtime::block_on(manager.install("PurgeUndesirables")).is_err());
+        assert!(manager
+            .paths
+            .load_chrome_state()
+            .unwrap()
+            .extensions
+            .is_empty());
+    }
+
+    #[test]
+    fn updating_a_stale_id_preserves_active_and_pending_files() {
+        let (_temp, mut manager, mutations) = manager_fixture();
+        register_wrong_id(&manager);
+        let pending = manager.paths.pending_dir("PurgeUndesirables", "1.1.0");
+        fs::create_dir_all(&pending).unwrap();
+        fs::write(pending.join("content.js"), "pending").unwrap();
+        let mut state = manager.paths.load_repository_state().unwrap();
+        let extension = state.extensions.get_mut("PurgeUndesirables").unwrap();
+        extension.pending_version = Some("1.1.0".into());
+        extension.pending_hashes = hash_directory(&pending).unwrap();
+        manager.paths.save_repository_state(&state).unwrap();
+        assert!(tauri::async_runtime::block_on(manager.update("PurgeUndesirables")).is_err());
+        assert_eq!(mutations.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fs::read_to_string(
+                manager
+                    .paths
+                    .extension_dir("PurgeUndesirables")
+                    .join("content.js")
+            )
+            .unwrap(),
+            "active"
+        );
+        assert_eq!(
+            fs::read_to_string(pending.join("content.js")).unwrap(),
+            "pending"
+        );
     }
 }

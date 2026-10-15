@@ -14,7 +14,7 @@ use core_foundation::base::TCFType;
 use core_foundation::string::CFString;
 use macos_accessibility_client::accessibility::application_is_trusted_with_prompt;
 
-use super::BrowserAutomationBackend;
+use super::{registration, BrowserAutomationBackend};
 
 const SYSTEM_CHROME_APP: &str = "/Applications/Google Chrome.app";
 const CHROME_EXECUTABLE: &str = "Contents/MacOS/Google Chrome";
@@ -66,7 +66,11 @@ impl MacOsChromeAutomation {
             .unwrap_or_default();
 
         Command::new(chrome)
-            .args(["--new-window", "chrome://extensions/"])
+            .args([
+                "--profile-directory=Default",
+                "--new-window",
+                "chrome://extensions/",
+            ])
             .spawn()
             .map_err(|error| format!("Could not open Google Chrome: {error}"))?;
 
@@ -211,7 +215,6 @@ impl BrowserAutomationBackend for MacOsChromeAutomation {
         }
 
         self.with_extensions_page(|app, window| {
-            let before = extension_ids(window);
             let load_unpacked = find_element(window, &is_load_unpacked_button)
                 .ok_or("Load unpacked was not exposed through Chrome accessibility")?;
             load_unpacked
@@ -222,9 +225,11 @@ impl BrowserAutomationBackend for MacOsChromeAutomation {
 
             let deadline = Instant::now() + Duration::from_secs(10);
             let chrome_id = loop {
-                let after = extension_ids(window);
-                if let Some(id) = after.difference(&before).next() {
-                    break id.clone();
+                let profile = dirs::home_dir()
+                    .ok_or("The home directory could not be resolved")?
+                    .join("Library/Application Support/Google/Chrome/Default");
+                if let Some(id) = registration::registered_id(&profile, extension_path)? {
+                    break id;
                 }
                 if Instant::now() >= deadline {
                     return Err(
@@ -240,12 +245,23 @@ impl BrowserAutomationBackend for MacOsChromeAutomation {
         })
     }
 
-    fn reload(&self, _: &str, _: &str) -> Result<(), String> {
+    fn verify_identity(
+        &self,
+        extension_path: &Path,
+        chrome_extension_id: &str,
+    ) -> Result<(), String> {
+        let profile = dirs::home_dir()
+            .ok_or("The home directory could not be resolved")?
+            .join("Library/Application Support/Google/Chrome/Default");
+        registration::verify(&profile, extension_path, chrome_extension_id)
+    }
+
+    fn reload(&self, _: &Path, _: &str, _: &str) -> Result<(), String> {
         self.preflight()?;
         Err(Self::unavailable_action("extension reload"))
     }
 
-    fn remove(&self, _: &str) -> Result<(), String> {
+    fn remove(&self, _: &Path, _: &str) -> Result<(), String> {
         self.preflight()?;
         Err(Self::unavailable_action("extension removal"))
     }
