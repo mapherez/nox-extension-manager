@@ -4,6 +4,7 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use uiautomation::errors::ERR_NOTFOUND;
 use uiautomation::inputs::Keyboard;
 use uiautomation::patterns::{UIInvokePattern, UIValuePattern, UIWindowPattern};
 use uiautomation::types::{ControlType, Handle};
@@ -12,8 +13,8 @@ use uiautomation::{UIAutomation, UIElement};
 use windows::core::BOOL;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClassNameW, GetWindow, GetWindowThreadProcessId, IsWindow, IsWindowVisible,
-    PostMessageW, GW_OWNER, WM_CLOSE,
+    EnumWindows, GetClassNameW, GetForegroundWindow, GetWindow, GetWindowThreadProcessId, IsWindow,
+    IsWindowVisible, PostMessageW, GW_OWNER, WM_CLOSE,
 };
 
 use super::{registration, BrowserAutomationBackend};
@@ -24,7 +25,7 @@ const FOLDER_PICKER_CONFIRM_ID: &str = "1";
 const DETAILS_REMOVE_ID: &str = "remove-extension";
 const DETAILS_REMOVE_NAMES: &[&str] =
     &["Remove extension", "Remover extensão", "Remover a extensão"];
-const REMOVE_NAMES: &[&str] = &["Remove", "Remover"];
+const REMOVE_CONFIRM_NAMES: &[&str] = &["Remove", "Remover", "OK"];
 
 pub struct WindowsChromeAutomation {
     profile: Option<crate::model::ChromeProfile>,
@@ -500,40 +501,48 @@ impl BrowserAutomationBackend for WindowsChromeAutomation {
             self.verify_identity(extension_path, chrome_extension_id)?;
             // Re-read the page immediately before invoking its destructive
             // action; stale navigation must never select another installation.
-            Self::verified_extension_details(automation, window, chrome_extension_id, &manifest.name)?;
+            Self::verified_extension_details(
+                automation,
+                window,
+                chrome_extension_id,
+                &manifest.name,
+            )?;
+            if !removal_dialogs(automation, window, &manifest.name)?.is_empty() {
+                return Err(
+                    "A removal popup was already open before this action; removal blocked".into(),
+                );
+            }
             invoke(&remove, "Remove")?;
-            let extension_name = manifest.name.clone();
-            let dialogs = automation
-                .create_matcher()
-                .from(window.clone())
-                .filter_fn(Box::new(move |element: &UIElement| {
-                    Ok((element.is_dialog().unwrap_or(false)
-                        || element.get_control_type()? == ControlType::Window)
-                        && element.get_name()?.contains(&extension_name))
-                }))
-                .depth(12)
-                .timeout(5_000)
-                .find_all()
-                .map_err(|error| {
-                    format!("Chrome did not expose a removal dialog naming this extension; removal blocked: {error}")
-                })?;
-            let dialog = exactly_one(dialogs, "removal dialog naming this extension")?;
+            let dialog = wait_for_removal_dialog(automation, window, &manifest.name)?;
             let buttons = automation
                 .create_matcher()
-                .from(dialog)
+                .from(dialog.clone())
                 .control_type(ControlType::Button)
                 .filter_fn(Box::new(|element: &UIElement| {
-                    Ok(name_matches(&element.get_name()?, REMOVE_NAMES))
+                    Ok(name_matches(&element.get_name()?, REMOVE_CONFIRM_NAMES))
                 }))
-                .depth(8)
+                .depth(20)
                 .timeout(3_000)
                 .find_all()
                 .map_err(|error| {
-                    format!("Chrome's removal confirmation was not found in the target dialog: {error}")
+                    format!(
+                        "Chrome's removal confirmation was not found in the target dialog: {error}"
+                    )
                 })?;
             let confirm = exactly_one(buttons, "removal confirmation")?;
+            prepare_removal_confirmation(automation, window, &dialog, &confirm)?;
             self.verify_identity(extension_path, chrome_extension_id)?;
-            invoke(&confirm, "Confirm Remove")?;
+            // Invoke can report success before Chrome has accepted its native
+            // popup. Activate the verified, focused button with a real keypress
+            // instead, once only. Never send Enter to an arbitrary active dialog.
+            require_removal_confirmation_focus(automation, window, &dialog, &confirm)?;
+            Keyboard::new()
+                .interval(0)
+                .send_keys("{space}")
+                .map_err(|error| {
+                    format!("Could not activate the removal popup's confirmation: {error}")
+                })?;
+            wait_for_removal_dialog_to_close(automation, window, &manifest.name, &dialog)?;
             let deadline = Instant::now() + Duration::from_secs(15);
             while registration::registered_id(&self.profile_directory()?, extension_path)?.is_some()
             {
@@ -556,6 +565,273 @@ impl BrowserAutomationBackend for WindowsChromeAutomation {
             }
         }
         result
+    }
+}
+
+// Removal confirmations can be UIA descendants or separate native popups.
+// Neither the browser window itself nor another window from the same process
+// is a confirmation. Require ancestry/ownership of this operation's window.
+fn native_window_is_owned_by(handle: isize, browser: isize) -> bool {
+    if handle == 0 || browser == 0 || handle == browser {
+        return false;
+    }
+    let mut current = native_handle(handle);
+    let mut seen = BTreeSet::from([handle]);
+    for _ in 0..32 {
+        // SAFETY: GetWindow only inspects the native ownership relationship.
+        let Ok(owner) = (unsafe { GetWindow(current, GW_OWNER) }) else {
+            return false;
+        };
+        let owner_handle = owner.0 as isize;
+        if owner_handle == browser {
+            return true;
+        }
+        if !seen.insert(owner_handle) {
+            return false;
+        }
+        current = owner;
+    }
+    false
+}
+
+fn removal_dialog_belongs_to_window(
+    automation: &UIAutomation,
+    dialog: &UIElement,
+    window: &UIElement,
+) -> Result<bool, String> {
+    if automation
+        .compare_elements(dialog, window)
+        .map_err(|error| error.to_string())?
+    {
+        return Ok(false);
+    }
+    if element_is_in_dialog(automation, dialog, window)? {
+        return Ok(true);
+    }
+    let handle: isize = dialog
+        .get_native_window_handle()
+        .map_err(|error| error.to_string())?
+        .into();
+    let browser: isize = window
+        .get_native_window_handle()
+        .map_err(|error| error.to_string())?
+        .into();
+    Ok(native_window_is_owned_by(handle, browser))
+}
+
+fn removal_dialogs(
+    automation: &UIAutomation,
+    window: &UIElement,
+    extension_name: &str,
+) -> Result<Vec<UIElement>, String> {
+    let scoped = automation
+        .create_matcher()
+        .from(window.clone())
+        .filter_fn(Box::new(|element: &UIElement| {
+            Ok(element.is_dialog().unwrap_or(false)
+                || element.get_control_type()? == ControlType::Window)
+        }))
+        .depth(30)
+        .timeout(0)
+        .find_all();
+    let mut candidates = match scoped {
+        Ok(elements) => elements,
+        Err(error) if error.code() == ERR_NOTFOUND => Vec::new(),
+        Err(error) => {
+            return Err(format!(
+                "Could not inspect Chrome's removal popups: {error}"
+            ))
+        }
+    };
+    let browser: isize = window
+        .get_native_window_handle()
+        .map_err(|error| error.to_string())?
+        .into();
+    let mut handles = Vec::<isize>::new();
+    // SAFETY: EnumWindows invokes the callback synchronously with this live Vec.
+    unsafe {
+        EnumWindows(
+            Some(collect_window),
+            LPARAM(&mut handles as *mut Vec<isize> as isize),
+        )
+    }
+    .map_err(|error| format!("Could not inspect native removal popups: {error}"))?;
+    for handle in handles {
+        if native_window_is_owned_by(handle, browser)
+            && unsafe { IsWindowVisible(native_handle(handle)).as_bool() }
+        {
+            let popup = automation
+                .element_from_handle(Handle::from(handle))
+                .map_err(|error| format!("Could not read the owned Chrome popup: {error}"))?;
+            candidates.push(popup);
+        }
+    }
+    let mut dialogs = Vec::new();
+    for candidate in candidates {
+        if !removal_dialog_belongs_to_window(automation, &candidate, window)? {
+            continue;
+        }
+        if candidate
+            .is_offscreen()
+            .map_err(|error| error.to_string())?
+        {
+            continue;
+        }
+        let title = candidate.get_name().map_err(|error| error.to_string())?;
+        let names_extension = if title.contains(extension_name) {
+            true
+        } else {
+            let expected_name = extension_name.to_string();
+            match automation
+                .create_matcher()
+                .from(candidate.clone())
+                .control_type(ControlType::Text)
+                .filter_fn(Box::new(move |element: &UIElement| {
+                    Ok(element.get_name()?.contains(&expected_name))
+                }))
+                .depth(20)
+                .timeout(0)
+                .find_all()
+            {
+                Ok(_) => true,
+                Err(error) if error.code() == ERR_NOTFOUND => false,
+                Err(error) => {
+                    return Err(format!(
+                        "Could not verify the removal popup's extension name: {error}"
+                    ))
+                }
+            }
+        };
+        if !names_extension {
+            continue;
+        }
+        let mut duplicate = false;
+        for existing in &dialogs {
+            if automation
+                .compare_elements(existing, &candidate)
+                .map_err(|error| error.to_string())?
+            {
+                duplicate = true;
+                break;
+            }
+        }
+        if !duplicate {
+            dialogs.push(candidate);
+        }
+    }
+    // Some UIA providers expose both the native popup Window and its inner
+    // Dialog. These are one prompt: retain the innermost named dialog rather
+    // than treating its wrapper as a second confirmation.
+    let mut isolated = Vec::new();
+    for (index, dialog) in dialogs.iter().enumerate() {
+        let mut wraps_dialog = false;
+        for (other_index, other) in dialogs.iter().enumerate() {
+            if index != other_index && element_is_in_dialog(automation, other, dialog)? {
+                wraps_dialog = true;
+                break;
+            }
+        }
+        if !wraps_dialog {
+            isolated.push(dialog.clone());
+        }
+    }
+    Ok(isolated)
+}
+
+fn wait_for_removal_dialog(
+    automation: &UIAutomation,
+    window: &UIElement,
+    extension_name: &str,
+) -> Result<UIElement, String> {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let dialogs = removal_dialogs(automation, window, extension_name)?;
+        if !dialogs.is_empty() {
+            return exactly_one(dialogs, "new removal popup owned by this Chrome window");
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("Chrome's confirmation popup for {extension_name} did not appear in this operation's window; no confirmation was sent"));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn prepare_removal_confirmation(
+    automation: &UIAutomation,
+    window: &UIElement,
+    dialog: &UIElement,
+    confirm: &UIElement,
+) -> Result<(), String> {
+    if !removal_dialog_belongs_to_window(automation, dialog, window)?
+        || !element_is_in_dialog(automation, confirm, dialog)?
+        || !confirm.is_enabled().map_err(|error| error.to_string())?
+        || !name_matches(
+            &confirm.get_name().map_err(|error| error.to_string())?,
+            REMOVE_CONFIRM_NAMES,
+        )
+    {
+        return Err("The confirmation button is not enabled in this operation's removal popup; action blocked".into());
+    }
+    confirm
+        .set_focus()
+        .map_err(|error| format!("Could not focus the removal popup's confirmation: {error}"))?;
+    require_removal_confirmation_focus(automation, window, dialog, confirm)
+}
+
+fn require_removal_confirmation_focus(
+    automation: &UIAutomation,
+    window: &UIElement,
+    dialog: &UIElement,
+    confirm: &UIElement,
+) -> Result<(), String> {
+    let focused = automation
+        .get_focused_element()
+        .map_err(|error| error.to_string())?;
+    let browser: isize = window
+        .get_native_window_handle()
+        .map_err(|error| error.to_string())?
+        .into();
+    // SAFETY: this is a read-only check immediately before sending input.
+    let foreground = unsafe { GetForegroundWindow() }.0 as isize;
+    if !removal_dialog_belongs_to_window(automation, dialog, window)?
+        || !element_is_in_dialog(automation, confirm, dialog)?
+        || !automation
+            .compare_elements(&focused, confirm)
+            .map_err(|error| error.to_string())?
+        || !(foreground == browser || native_window_is_owned_by(foreground, browser))
+    {
+        return Err("Focus is outside the verified removal confirmation; no key was sent".into());
+    }
+    Ok(())
+}
+
+fn wait_for_removal_dialog_to_close(
+    automation: &UIAutomation,
+    window: &UIElement,
+    extension_name: &str,
+    dialog: &UIElement,
+) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let current = removal_dialogs(automation, window, extension_name)?;
+        let mut still_open = false;
+        for candidate in current {
+            if automation
+                .compare_elements(&candidate, dialog)
+                .map_err(|error| error.to_string())?
+            {
+                still_open = true;
+            } else {
+                return Err("A different removal popup appeared after confirmation; no further input was sent".into());
+            }
+        }
+        if !still_open {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err("Chrome's removal popup remained open after activating its confirmation; no retry or alternate button was attempted".into());
+        }
+        thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -629,7 +905,7 @@ fn read_picker_window(handle: isize) -> Result<Option<PickerWindow>, String> {
 }
 
 unsafe extern "system" fn collect_window(hwnd: HWND, parameter: LPARAM) -> BOOL {
-    // SAFETY: EnumWindows calls synchronously; picker_windows keeps this Vec
+    // SAFETY: EnumWindows calls synchronously; the caller keeps this Vec
     // alive and exclusively borrowed until enumeration completes.
     let handles = unsafe { &mut *(parameter.0 as *mut Vec<isize>) };
     handles.push(hwnd.0 as isize);
@@ -1035,6 +1311,25 @@ mod tests {
         assert!(exactly_one::<u8>(vec![], "Remove").is_err());
         assert!(exactly_one(vec![1, 2], "Remove").is_err());
         assert_eq!(exactly_one(vec![1], "Remove").unwrap(), 1);
+    }
+
+    #[test]
+    fn removal_popup_accepts_ok_and_remove_but_never_cancel_or_other_actions() {
+        for affirmative in ["OK", "Ok", "Remove", "Remover"] {
+            assert!(name_matches(affirmative, REMOVE_CONFIRM_NAMES));
+        }
+        for other in [
+            "Cancel",
+            "Cancelar",
+            "Close",
+            "Remove extension",
+            "Remove all",
+            "Not OK",
+        ] {
+            assert!(!name_matches(other, REMOVE_CONFIRM_NAMES));
+        }
+        assert!(exactly_one::<u8>(vec![], "popup confirmation").is_err());
+        assert!(exactly_one(vec![1, 2], "popup confirmation").is_err());
     }
 
     #[test]
