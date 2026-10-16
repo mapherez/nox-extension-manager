@@ -16,8 +16,8 @@ import type { ActionOptions, ActionTarget, ChromeInstallation, ExtensionAction, 
 const statusCopy: Record<ExtensionStatus, string> = {
   notInstalled: 'Not installed', ambiguous: 'Choose installation', detectionUnavailable: 'Detection unavailable',
   downloading: 'Downloading',
-  readyToInstall: 'Ready to install', installed: 'Installed', updateReady: 'Update ready',
-  locallyModified: 'Locally modified', unavailable: 'Unavailable', error: 'Error',
+  installed: 'Installed', updateReady: 'Update ready',
+  unavailable: 'Unavailable', error: 'Error',
 };
 
 function App() {
@@ -222,7 +222,7 @@ function StatusIcon({ status }: { status: ExtensionStatus }) {
   if (status === 'downloading') return <RefreshCw className="spin" size={16} />;
   if (status === 'installed') return <Check size={17} />;
   if (status === 'updateReady') return <RefreshCw size={16} />;
-  if (status === 'locallyModified' || status === 'unavailable' || status === 'error') return <AlertTriangle size={16} />;
+  if (status === 'unavailable' || status === 'error') return <AlertTriangle size={16} />;
   return <Circle size={16} />;
 }
 
@@ -268,7 +268,7 @@ function AppFooter() {
 }
 
 export function ConfirmDialog({ extension, action, target, consent, onCancel, onConfirm }: {
-  extension: ExtensionView; action: 'remove' | 'repair' | 'install' | 'update'; target?: ActionTarget;
+  extension: ExtensionView; action: 'remove' | 'install' | 'update'; target?: ActionTarget;
   consent?: OverwriteConsent; onCancel: () => void; onConfirm: () => void;
 }) {
   const cancelButton = useRef<HTMLButtonElement>(null);

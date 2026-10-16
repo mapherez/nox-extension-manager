@@ -12,8 +12,8 @@ use sha2::Sha256;
 use url::Url;
 
 use crate::model::{
-    ChromeManifest, ChromeState, ExtensionStatus, ExtensionView, ManagedExtension, ManagerSnapshot,
-    RemoteFile, RepositoryConfig, RepositoryState,
+    ChromeManifest, ChromeState, ExtensionStatus, ExtensionView, ManagerSnapshot, RemoteFile,
+    RepositoryConfig, RepositoryState,
 };
 use crate::storage::StoragePaths;
 

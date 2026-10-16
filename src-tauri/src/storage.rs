@@ -70,10 +70,6 @@ impl StoragePaths {
         self.updates.join(id).join(version)
     }
 
-    pub fn backup_dir(&self, id: &str) -> PathBuf {
-        self.backups.join(id)
-    }
-
     pub fn load_repository_state(&self) -> Result<RepositoryState, String> {
         match load_json_or_default(&self.repository_state) {
             Ok(state) => Ok(state),
@@ -94,10 +90,6 @@ impl StoragePaths {
 
     pub fn save_repository_state(&self, state: &RepositoryState) -> Result<(), String> {
         save_json_atomic(&self.repository_state, state)
-    }
-
-    pub fn load_chrome_state(&self) -> Result<ChromeState, String> {
-        load_json_or_default(&self.chrome_state)
     }
 
     pub fn save_chrome_state(&self, state: &ChromeState) -> Result<(), String> {

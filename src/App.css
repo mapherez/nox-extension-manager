@@ -181,7 +181,7 @@ h1 { margin: 0; font-size: clamp(30px, 3.2vw, 40px); line-height: 1; letter-spac
 }
 
 .extension-card:hover { border-color: #3d5471; }
-.extension-card.status-error, .extension-card.status-locallyModified { border-color: rgba(218, 124, 71, .55); }
+.extension-card.status-error { border-color: rgba(218, 124, 71, .55); }
 .extension-card.status-unavailable { opacity: .72; }
 
 .extension-icon {
@@ -225,7 +225,7 @@ h1 { margin: 0; font-size: clamp(30px, 3.2vw, 40px); line-height: 1; letter-spac
 .pill-installed { border-color: rgba(49, 184, 141, .16); background: rgba(31, 150, 114, .18); color: var(--green); }
 .pill-updateReady { border-color: rgba(49, 135, 255, .35); background: rgba(27, 111, 234, .18); color: #78b8ff; }
 .pill-downloading { border-color: rgba(49, 135, 255, .35); background: rgba(27, 111, 234, .18); color: #78b8ff; }
-.pill-locallyModified, .pill-unavailable { border-color: rgba(220, 151, 54, .3); background: rgba(192, 125, 34, .14); color: var(--amber); }
+.pill-unavailable { border-color: rgba(220, 151, 54, .3); background: rgba(192, 125, 34, .14); color: var(--amber); }
 .pill-error { border-color: rgba(223, 82, 99, .32); background: rgba(190, 54, 69, .14); color: var(--red); }
 
 .card-actions { display: flex; justify-content: flex-end; gap: 10px; min-width: 250px; }

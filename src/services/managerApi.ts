@@ -27,7 +27,7 @@ const browserPreview: ManagerSnapshot = {
       installedVersion: null,
       availableVersion: '2.1.0',
       iconPath: null,
-      status: 'readyToInstall',
+      status: 'notInstalled',
       problem: null,
     },
     {

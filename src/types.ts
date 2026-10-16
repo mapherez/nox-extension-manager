@@ -3,10 +3,8 @@ export type ExtensionStatus =
   | 'ambiguous'
   | 'detectionUnavailable'
   | 'downloading'
-  | 'readyToInstall'
   | 'installed'
   | 'updateReady'
-  | 'locallyModified'
   | 'unavailable'
   | 'error';
 
@@ -41,7 +39,7 @@ export type ExtensionActionResult = {
   snapshot: ManagerSnapshot;
 };
 
-export type ExtensionAction = 'download' | 'install' | 'update' | 'remove' | 'repair';
+export type ExtensionAction = 'download' | 'install' | 'update' | 'remove';
 
 export type ChromeProfile = { id: string; name: string; path: string };
 export type ChromeInstallation = { chromeExtensionId: string; path: string; name: string; version: string; unpacked: boolean };

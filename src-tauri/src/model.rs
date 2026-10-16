@@ -65,10 +65,8 @@ pub enum ExtensionStatus {
     NotInstalled,
     Ambiguous,
     DetectionUnavailable,
-    ReadyToInstall,
     Installed,
     UpdateReady,
-    LocallyModified,
     Unavailable,
     Error,
 }
