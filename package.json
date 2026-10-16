@@ -2,7 +2,7 @@
   "name": "nox-extension-manager",
   "description": "Manage local Google Chrome extensions from a trusted GitHub repository.",
   "private": true,
-  "version": "1.0.5",
+  "version": "1.0.6",
   "type": "module",
   "scripts": {
     "dev": "vite",
