@@ -37,6 +37,7 @@ url = "2"
 
 [target.'cfg(windows)'.dependencies]
 uiautomation = { version = "0.25", default-features = false, features = ["control", "input", "process"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 accessibility = "0.2"
