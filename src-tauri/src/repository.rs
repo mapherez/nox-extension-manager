@@ -153,17 +153,6 @@ impl RepositoryClient {
         paths.save_repository_state(state)
     }
 
-    #[cfg(test)]
-    pub async fn restore_files(
-        &self,
-        paths: &StoragePaths,
-        state: &mut RepositoryState,
-        _chrome: &ChromeState,
-        id: &str,
-    ) -> Result<(), String> {
-        self.download(paths, state, id).await
-    }
-
     async fn fetch_directory(&self, directory: &str) -> Result<Vec<GitHubContentItem>, String> {
         let mut url = Url::parse(&self.api_base)
             .map_err(|error| format!("Could not construct the GitHub contents URL: {error}"))?;

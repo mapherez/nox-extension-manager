@@ -1,6 +1,17 @@
 use std::path::Path;
 
 pub trait BrowserAutomationBackend: Send + Sync {
+    fn profiles(&self) -> Result<Vec<crate::model::ChromeProfile>, String> {
+        registration::profiles()
+    }
+
+    fn inventory(
+        &self,
+        profile: &crate::model::ChromeProfile,
+    ) -> Result<Vec<crate::model::ChromeInstallation>, String> {
+        registration::inventory(Path::new(&profile.path))
+    }
+
     fn for_profile(
         &self,
         _: &crate::model::ChromeProfile,

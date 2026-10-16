@@ -1,39 +1,43 @@
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ConfirmDialog, ExtensionCard, appUpdateStatus, syncStatus } from './App';
-import type { ExtensionStatus, ExtensionView } from './types';
+import type { ActionTarget, ExtensionStatus, ExtensionView } from './types';
 
 afterEach(cleanup);
 
-function extension(status: ExtensionStatus): ExtensionView {
-  const installed = ['installed', 'updateReady', 'locallyModified', 'unavailable', 'error'].includes(status);
+const selectedTarget: ActionTarget = {
+  profileId: 'Default', chromeExtensionId: 'abcdefghijklmnopabcdefghijklmnop',
+  path: 'C:/extensions/sample', version: '1.0.0',
+};
+
+function extension(status: ExtensionStatus, downloaded = false): ExtensionView {
+  const installed = ['installed', 'updateReady', 'unavailable', 'error'].includes(status);
   return {
-    id: 'test-extension',
-    name: 'Test Extension',
-    description: 'Used by the interface tests',
-    localVersion: '1.0.0',
-    installedVersion: installed ? '1.0.0' : null,
+    id: 'sample-extension', name: 'Sample Extension', description: 'Fixture extension',
+    localVersion: null, installedVersion: installed ? '1.0.0' : null,
     availableVersion: status === 'updateReady' ? '1.1.0' : '1.0.0',
-    iconPath: null,
-    status,
-    problem: status === 'error' ? 'Example failure' : null,
+    iconPath: null, status, problem: status === 'error' ? 'Example failure' : null,
+    downloadState: downloaded ? 'downloaded' : 'notDownloaded',
+    downloadedVersion: downloaded ? (status === 'updateReady' ? '1.1.0' : '1.0.0') : null,
+    installations: installed ? [{ ...selectedTarget, name: 'Sample Extension', unpacked: true }] : [],
   };
 }
 
-function renderCard(status: ExtensionStatus, downloading = false) {
+function renderCard(status: ExtensionStatus, downloaded = false, downloading = false) {
   const onAction = vi.fn();
   const onRemove = vi.fn();
-  render(<ExtensionCard extension={extension(status)} index={0} busy={false}
+  render(<ExtensionCard extension={extension(status, downloaded)} index={0} busy={downloading}
     downloading={downloading} disabled={false} onAction={onAction} onRemove={onRemove} />);
   return { onAction, onRemove };
 }
 
 describe('extension cards', () => {
   it.each([
-    ['readyToInstall', 'Ready to install'],
+    ['notInstalled', 'Not installed'],
     ['installed', 'Installed'],
     ['updateReady', 'Update ready'],
-    ['locallyModified', 'Locally modified'],
+    ['ambiguous', 'Choose installation'],
+    ['detectionUnavailable', 'Detection unavailable'],
     ['unavailable', 'Unavailable'],
     ['error', 'Error'],
   ] as const)('renders the %s state', (status, label) => {
@@ -41,43 +45,92 @@ describe('extension cards', () => {
     expect(screen.getByText(label)).toBeInTheDocument();
   });
 
-  it('shows Downloading while a synchronization is active', () => {
-    renderCard('installed', true);
+  it('shows Downloading only for an explicit active download', () => {
+    renderCard('notInstalled', false, true);
     expect(screen.getByText('Downloading')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /downloading/i })).toBeDisabled();
   });
 
-  it('invokes Install for an extension that is ready', () => {
-    const { onAction } = renderCard('readyToInstall');
-    fireEvent.click(screen.getByRole('button', { name: /install/i }));
-    expect(onAction).toHaveBeenCalledWith('install', 'test-extension');
+  it('offers Download before Install and does not request installation', () => {
+    const { onAction } = renderCard('notInstalled');
+    expect(screen.queryByRole('button', { name: /^install$/i })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /^download$/i }));
+    expect(onAction).toHaveBeenCalledWith('download', 'sample-extension', undefined);
+    expect(onAction).toHaveBeenCalledOnce();
   });
 
-  it('shows and invokes Update and Remove together', () => {
+  it('offers Install only after the package has been downloaded', () => {
+    const { onAction } = renderCard('notInstalled', true);
+    fireEvent.click(screen.getByRole('button', { name: /^install$/i }));
+    expect(onAction).toHaveBeenCalledWith('install', 'sample-extension', undefined);
+  });
+
+  it('offers Download update with the exact current target and a separate Remove action', () => {
     const { onAction, onRemove } = renderCard('updateReady');
     expect(screen.getByText(/Installed v1.0.0/)).toBeInTheDocument();
     expect(screen.getByText(/Available v1.1.0/)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: /update/i }));
-    fireEvent.click(screen.getByRole('button', { name: /remove/i }));
-    expect(onAction).toHaveBeenCalledWith('update', 'test-extension');
-    expect(onRemove).toHaveBeenCalledOnce();
+    expect(screen.queryByRole('button', { name: /^install update$/i })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /^download update$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^remove$/i }));
+    expect(onAction).toHaveBeenCalledWith('download', 'sample-extension', selectedTarget);
+    expect(onRemove).toHaveBeenCalledWith(selectedTarget);
   });
 
-  it('repairs the selected extension when local files were modified', () => {
-    const { onAction, onRemove } = renderCard('locallyModified');
-    fireEvent.click(screen.getByRole('button', { name: 'Restore repository files for Test Extension' }));
-    expect(onAction).toHaveBeenCalledWith('repair', 'test-extension');
-    expect(onRemove).not.toHaveBeenCalled();
+  it('offers Install update after download, preserving the selected registration', () => {
+    const { onAction } = renderCard('updateReady', true);
+    fireEvent.click(screen.getByRole('button', { name: /^install update$/i }));
+    expect(onAction).toHaveBeenCalledWith('update', 'sample-extension', selectedTarget);
   });
 
-  it('explains replacement and backup before a repair can proceed', () => {
+  it('requires an explicit selection when installed manifests share the same name', () => {
+    const onAction = vi.fn();
+    const onRemove = vi.fn();
+    const first = extension('updateReady').installations![0];
+    const second = { ...first, chromeExtensionId: 'ponmlkjihgfedcbaponmlkjihgfedcba', path: 'D:/other/sample' };
+    render(<ExtensionCard extension={{ ...extension('ambiguous'), availableVersion: '1.1.0', installations: [first, second] }}
+      index={0} busy={false} downloading={false} disabled={false} onAction={onAction} onRemove={onRemove} />);
+    expect(screen.queryByRole('button', { name: /^remove$/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^download update$/i })).not.toBeInTheDocument();
+    fireEvent.change(screen.getByRole('combobox', { name: 'Installation for Sample Extension' }), {
+      target: { value: second.chromeExtensionId },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /^remove$/i }));
+    expect(onRemove).toHaveBeenCalledWith({ ...selectedTarget, chromeExtensionId: second.chromeExtensionId, path: second.path });
+  });
+
+  it('does not offer Repair or Restore for a normally installed extension', () => {
+    renderCard('installed');
+    expect(screen.queryByRole('button', { name: /repair|restore/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /install|download/i })).not.toBeInTheDocument();
+  });
+
+  it('shows the exact removal target and waits for confirmation', () => {
     const onConfirm = vi.fn();
     const onCancel = vi.fn();
-    render(<ConfirmDialog extension={extension('locallyModified')} action="repair" onConfirm={onConfirm} onCancel={onCancel} />);
-    expect(screen.getByRole('alertdialog')).toHaveTextContent('A backup of the current files will be kept');
+    render(<ConfirmDialog extension={extension('installed')} action="remove" target={selectedTarget}
+      onConfirm={onConfirm} onCancel={onCancel} />);
+    const dialog = screen.getByRole('dialog');
+    expect(dialog).toHaveTextContent(selectedTarget.chromeExtensionId);
+    expect(dialog).toHaveTextContent(selectedTarget.path);
+    expect(dialog).toHaveTextContent('Profile: Default');
+    expect(dialog).toHaveTextContent('may delete its extension data');
     expect(onConfirm).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
     expect(onCancel).toHaveBeenCalledOnce();
     expect(onConfirm).not.toHaveBeenCalled();
+  });
+
+  it('explains the replacement folder and backup before installing over untrusted files', () => {
+    const onConfirm = vi.fn();
+    render(<ConfirmDialog extension={extension('updateReady', true)} action="update" target={selectedTarget}
+      consent={{ profileId: 'Default', path: selectedTarget.path, hashes: { 'content.js': 'original-hash' } }}
+      onConfirm={onConfirm} onCancel={vi.fn()} />);
+    const dialog = screen.getByRole('dialog');
+    expect(dialog).toHaveTextContent('backup is created beside this folder');
+    expect(dialog).toHaveTextContent(selectedTarget.path);
+    expect(onConfirm).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Back up and install' }));
+    expect(onConfirm).toHaveBeenCalledOnce();
   });
 });
 

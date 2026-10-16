@@ -30,7 +30,7 @@ impl ManagerService {
     }
 
     fn profile(&self) -> Result<(Vec<ChromeProfile>, ChromeProfile), String> {
-        let profiles = registration::profiles()?;
+        let profiles = self.automation.profiles()?;
         let selected = self
             .paths
             .preferences()
@@ -48,7 +48,7 @@ impl ManagerService {
     }
 
     pub fn select_profile(&self, id: &str) -> Result<ManagerSnapshot, String> {
-        if !registration::profiles()?.iter().any(|p| p.id == id) {
+        if !self.automation.profiles()?.iter().any(|p| p.id == id) {
             return Err("Unknown Chrome profile".into());
         }
         self.paths.save_preferences(&ManagerPreferences {
@@ -68,11 +68,11 @@ impl ManagerService {
         let inventory = match self.profile() {
             Ok((profiles, profile)) => {
                 snapshot.profiles = profiles;
-                snapshot.selected_profile = profile.id;
-                registration::inventory(Path::new(&profile.path))
+                snapshot.selected_profile = profile.id.clone();
+                self.automation.inventory(&profile)
             }
             Err(error) => {
-                snapshot.profiles = registration::profiles().unwrap_or_default();
+                snapshot.profiles = self.automation.profiles().unwrap_or_default();
                 snapshot.selected_profile = self
                     .paths
                     .preferences()
@@ -188,7 +188,7 @@ impl ManagerService {
             .get(id)
             .cloned()
             .ok_or("Unknown catalog extension; Sync first")?;
-        let items = registration::inventory(Path::new(&profile.path))?;
+        let items = self.automation.inventory(&profile)?;
         let matches: Vec<_> = items.into_iter().filter(|i| i.name == entry.name).collect();
         if let Some(target) = target {
             if target.profile_id != profile.id {
@@ -437,7 +437,7 @@ impl ManagerService {
     ) -> Result<ExtensionActionResult, String> {
         let (profile, _, installed) = self.resolve(id, Some(&target))?;
         let installed = installed.ok_or("Select an installed extension")?;
-        let before = registration::inventory(Path::new(&profile.path))?;
+        let before = self.automation.inventory(&profile)?;
         let backend = self.automation.for_profile(&profile)?;
         let path = PathBuf::from(&installed.path);
         let chrome_id = installed.chrome_extension_id.clone();
@@ -447,7 +447,7 @@ impl ManagerService {
         })
         .await
         .map_err(|e| e.to_string())??;
-        let after = registration::inventory(Path::new(&profile.path))?;
+        let after = self.automation.inventory(&profile)?;
         if after
             .iter()
             .any(|i| i.chrome_extension_id == installed.chrome_extension_id)
@@ -471,106 +471,153 @@ impl ManagerService {
             snapshot: self.snapshot()?,
         })
     }
-
-    #[cfg(test)]
-    pub async fn install(&mut self, id: &str) -> Result<ExtensionActionResult, String> {
-        self.apply(id, None, None).await
-    }
-    #[cfg(test)]
-    pub async fn update(&mut self, id: &str) -> Result<ExtensionActionResult, String> {
-        self.apply(id, None, None).await
-    }
-    #[cfg(test)]
-    pub async fn remove(&mut self, _: &str) -> Result<ExtensionActionResult, String> {
-        Err("Exact Chrome target is required".into())
-    }
-}
-
-#[cfg(test)]
-fn prune_backups(directory: &std::path::Path, keep: usize) -> Result<(), String> {
-    let mut backups: Vec<_> = fs::read_dir(directory)
-        .map_err(|error| format!("Could not inspect extension backups: {error}"))?
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-        .collect();
-    backups.sort_by_key(|entry| {
-        entry
-            .file_name()
-            .to_string_lossy()
-            .rsplit_once('-')
-            .and_then(|(_, timestamp)| timestamp.parse::<i64>().ok())
-            .unwrap_or_default()
-    });
-    let remove_count = backups.len().saturating_sub(keep);
-    for entry in backups.into_iter().take(remove_count) {
-        fs::remove_dir_all(entry.path())
-            .map_err(|error| format!("Could not prune an old extension backup: {error}"))?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ChromeState, ManagedExtension, RepositoryState};
-    use std::fs;
-    use std::path::Path;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
-    #[test]
-    fn backup_retention_keeps_the_newest_three() {
-        let temp = tempfile::tempdir().unwrap();
-        for name in ["1.0.0-1", "1.0.0-2", "1.0.0-3", "1.0.0-4", "1.0.0-5"] {
-            fs::create_dir(temp.path().join(name)).unwrap();
-        }
-        prune_backups(temp.path(), 3).unwrap();
-        let mut remaining: Vec<_> = fs::read_dir(temp.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
-            .collect();
-        remaining.sort();
-        assert_eq!(remaining, ["1.0.0-3", "1.0.0-4", "1.0.0-5"]);
-    }
+    const CATALOG_ID: &str = "SampleExtension";
+    const OWNED: &str = "abcdefghijklmnopabcdefghijklmnop";
+    const OTHER: &str = "ponmlkjihgfedcbaponmlkjihgfedcba";
 
-    struct WrongRegistration {
+    #[derive(Clone)]
+    struct FixtureBrowser {
+        profiles: Vec<ChromeProfile>,
         mutations: Arc<AtomicUsize>,
+        fail_version: Option<String>,
     }
 
-    impl BrowserAutomationBackend for WrongRegistration {
-        fn registered_id(&self, _: &Path) -> Result<Option<String>, String> {
-            Err("Chrome ID belongs to BetterTTV, not the requested directory".into())
+    impl BrowserAutomationBackend for FixtureBrowser {
+        fn profiles(&self) -> Result<Vec<ChromeProfile>, String> {
+            Ok(self.profiles.clone())
+        }
+        fn for_profile(
+            &self,
+            profile: &ChromeProfile,
+        ) -> Result<Arc<dyn BrowserAutomationBackend>, String> {
+            if !self
+                .profiles
+                .iter()
+                .any(|p| p.id == profile.id && p.path == profile.path)
+            {
+                return Err("Unknown fixture profile".into());
+            }
+            Ok(Arc::new(Self {
+                profiles: vec![profile.clone()],
+                ..self.clone()
+            }))
         }
         fn preflight(&self) -> Result<(), String> {
             Ok(())
         }
+        fn registered_id(&self, path: &Path) -> Result<Option<String>, String> {
+            registration::registered_id(Path::new(&self.profiles[0].path), path)
+        }
         fn install(&self, _: &Path, _: &str) -> Result<String, String> {
-            Ok("ajopnjidmegmdimjlfnijceegpefgped".into())
+            Err("Unexpected new-install automation in this fixture".into())
         }
-        fn verify_identity(&self, _: &Path, _: &str) -> Result<(), String> {
-            Err("Chrome ID belongs to BetterTTV, not the requested directory".into())
+        fn verify_identity(&self, path: &Path, id: &str) -> Result<(), String> {
+            registration::verify(Path::new(&self.profiles[0].path), path, id)
         }
-        fn reload(&self, _: &Path, _: &str, _: &str) -> Result<(), String> {
-            self.mutations.fetch_add(1, Ordering::SeqCst);
+        fn reload(&self, path: &Path, id: &str, version: &str) -> Result<(), String> {
+            self.verify_identity(path, id)?;
+            self.mutations.fetch_add(1, AtomicOrdering::SeqCst);
+            if self.fail_version.as_deref() == Some(version) {
+                return Err("Chrome rejected the update".into());
+            }
+            let manifest: ChromeManifest = serde_json::from_slice(
+                &fs::read(path.join("manifest.json")).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+            if manifest.version != version {
+                return Err("Unexpected reloaded version".into());
+            }
             Ok(())
         }
-        fn remove(&self, _: &Path, _: &str) -> Result<(), String> {
-            self.mutations.fetch_add(1, Ordering::SeqCst);
+        fn remove(&self, path: &Path, id: &str) -> Result<(), String> {
+            self.verify_identity(path, id)?;
+            let preferences = Path::new(&self.profiles[0].path).join("Secure Preferences");
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&fs::read(&preferences).map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?;
+            value
+                .pointer_mut("/extensions/settings")
+                .and_then(serde_json::Value::as_object_mut)
+                .ok_or("Missing fixture registrations")?
+                .remove(id);
+            fs::write(
+                preferences,
+                serde_json::to_vec(&value).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+            self.mutations.fetch_add(1, AtomicOrdering::SeqCst);
             Ok(())
         }
     }
 
-    fn manager_fixture() -> (tempfile::TempDir, ManagerService, Arc<AtomicUsize>) {
+    struct Fixture {
+        _temp: tempfile::TempDir,
+        manager: ManagerService,
+        profiles: Vec<ChromeProfile>,
+        active: PathBuf,
+        unrelated: PathBuf,
+        mutations: Arc<AtomicUsize>,
+    }
+
+    fn write_extension(path: &Path, name: &str, version: &str) {
+        fs::create_dir_all(path).unwrap();
+        fs::write(
+            path.join("manifest.json"),
+            json!({
+                "manifest_version": 3, "name": name, "version": version,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(path.join("content.js"), format!("// {name} {version}")).unwrap();
+    }
+
+    fn fixture(fail_version: Option<&str>) -> Fixture {
         let temp = tempfile::tempdir().unwrap();
         let paths = StoragePaths::from_root(temp.path().join("managed"));
         paths.ensure().unwrap();
-        let active = paths.extension_dir("PurgeUndesirables");
-        fs::create_dir(&active).unwrap();
-        fs::write(active.join("content.js"), "active").unwrap();
+        let active = temp.path().join("external-installations").join("active");
+        let unrelated = temp.path().join("external-installations").join("unrelated");
+        write_extension(&active, "Sample Extension", "1.0.0");
+        write_extension(&unrelated, "Unrelated Extension", "7.0.0");
+        let profiles: Vec<_> = ["Default", "Profile 1"]
+            .into_iter()
+            .map(|id| {
+                let path = temp.path().join("chrome").join(id);
+                fs::create_dir_all(&path).unwrap();
+                fs::write(
+                    path.join("Secure Preferences"),
+                    json!({"extensions": {"settings": {}}}).to_string(),
+                )
+                .unwrap();
+                ChromeProfile {
+                    id: id.into(),
+                    name: id.into(),
+                    path: path.to_string_lossy().into(),
+                }
+            })
+            .collect();
+        fs::write(
+            Path::new(&profiles[0].path).join("Secure Preferences"),
+            json!({"extensions": {"settings": {
+                OWNED: {"path": active, "location": 4},
+                OTHER: {"path": unrelated, "location": 4},
+            }}})
+            .to_string(),
+        )
+        .unwrap();
         let entry = ManagedExtension {
-            id: "PurgeUndesirables".into(),
-            name: "PurgeUndesirables".into(),
-            active_version: Some("1.0.0".into()),
-            active_hashes: hash_directory(&active).unwrap(),
+            id: CATALOG_ID.into(),
+            name: "Sample Extension".into(),
+            remote_version: "1.1.0".into(),
             available: true,
             ..ManagedExtension::default()
         };
@@ -580,7 +627,6 @@ mod tests {
                 ..RepositoryState::default()
             })
             .unwrap();
-        let mutations = Arc::new(AtomicUsize::new(0));
         let repository = RepositoryClient::new(RepositoryConfig {
             repository: "owner/repo".into(),
             branch: "master".into(),
@@ -588,83 +634,339 @@ mod tests {
             repository_url: "https://github.com/owner/repo".into(),
         })
         .unwrap();
+        let mutations = Arc::new(AtomicUsize::new(0));
         let manager = ManagerService {
             paths,
             repository,
-            automation: Arc::new(WrongRegistration {
+            automation: Arc::new(FixtureBrowser {
+                profiles: profiles.clone(),
                 mutations: mutations.clone(),
+                fail_version: fail_version.map(str::to_owned),
             }),
         };
-        (temp, manager, mutations)
+        Fixture {
+            _temp: temp,
+            manager,
+            profiles,
+            active,
+            unrelated,
+            mutations,
+        }
     }
 
-    fn register_wrong_id(manager: &ManagerService) {
-        manager
+    fn target(fixture: &Fixture) -> ActionTarget {
+        ActionTarget {
+            profile_id: "Default".into(),
+            chrome_extension_id: OWNED.into(),
+            path: fixture.active.to_string_lossy().into(),
+            version: "1.0.0".into(),
+        }
+    }
+
+    fn stage_update(fixture: &Fixture) {
+        let pending = fixture.manager.paths.pending_dir(CATALOG_ID, "1.1.0");
+        write_extension(&pending, "Sample Extension", "1.1.0");
+        let mut state = fixture.manager.paths.load_repository_state().unwrap();
+        let entry = state.extensions.get_mut(CATALOG_ID).unwrap();
+        entry.pending_version = Some("1.1.0".into());
+        entry.pending_hashes = hash_directory(&pending).unwrap();
+        fixture.manager.paths.save_repository_state(&state).unwrap();
+    }
+
+    #[test]
+    fn snapshot_recovers_installation_from_chrome_without_manager_install_records() {
+        let fixture = fixture(None);
+        fs::remove_file(&fixture.manager.paths.chrome_state).unwrap();
+        let snapshot = fixture.manager.snapshot().unwrap();
+        let extension = &snapshot.extensions[0];
+        assert!(matches!(extension.status, ExtensionStatus::UpdateReady));
+        assert_eq!(extension.installed_version.as_deref(), Some("1.0.0"));
+        assert_eq!(extension.installations[0].chrome_extension_id, OWNED);
+        assert_eq!(
+            extension.installations[0].path,
+            fixture.active.to_string_lossy()
+        );
+        assert_eq!(extension.download_state, "notDownloaded");
+        assert!(!fixture.manager.paths.extension_dir(CATALOG_ID).exists());
+        assert_eq!(fixture.mutations.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[test]
+    fn stale_manager_ids_are_ignored_and_wrong_removal_targets_are_blocked() {
+        let mut fixture = fixture(None);
+        fixture
+            .manager
             .paths
             .save_chrome_state(&ChromeState {
                 extensions: std::collections::BTreeMap::from([(
-                    "PurgeUndesirables".into(),
+                    CATALOG_ID.into(),
                     ChromeInstallRecord {
-                        chrome_extension_id: "ajopnjidmegmdimjlfnijceegpefgped".into(),
+                        chrome_extension_id: OTHER.into(),
                         version: "1.0.0".into(),
                         installed_at: String::new(),
                     },
                 )]),
             })
             .unwrap();
-    }
-
-    #[test]
-    fn removing_a_stale_id_never_reaches_chrome_or_changes_records() {
-        let (_temp, mut manager, mutations) = manager_fixture();
-        register_wrong_id(&manager);
-        let before = fs::read(&manager.paths.chrome_state).unwrap();
+        let cached = fs::read(&fixture.manager.paths.chrome_state).unwrap();
+        assert_eq!(
+            fixture.manager.snapshot().unwrap().extensions[0].installations[0].chrome_extension_id,
+            OWNED
+        );
+        let mut wrong = target(&fixture);
+        wrong.chrome_extension_id = OTHER.into();
         let error =
-            tauri::async_runtime::block_on(manager.remove("PurgeUndesirables")).unwrap_err();
-        assert!(error.contains("BetterTTV"));
-        assert_eq!(mutations.load(Ordering::SeqCst), 0);
-        assert_eq!(fs::read(&manager.paths.chrome_state).unwrap(), before);
+            tauri::async_runtime::block_on(fixture.manager.remove_selected(CATALOG_ID, wrong))
+                .unwrap_err();
+        assert!(error.contains("installation changed"));
+        assert_eq!(fixture.mutations.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(
+            fs::read(&fixture.manager.paths.chrome_state).unwrap(),
+            cached
+        );
+        assert!(fixture.active.join("manifest.json").exists());
+        assert!(fixture.unrelated.join("manifest.json").exists());
     }
 
     #[test]
-    fn installing_does_not_save_an_id_for_an_unrelated_extension() {
-        let (_temp, mut manager, _) = manager_fixture();
-        assert!(tauri::async_runtime::block_on(manager.install("PurgeUndesirables")).is_err());
-        assert!(manager
-            .paths
-            .load_chrome_state()
+    fn removal_uses_only_the_selected_registration_and_keeps_source_files() {
+        let mut fixture = fixture(None);
+        let selected = target(&fixture);
+        let unrelated = hash_directory(&fixture.unrelated).unwrap();
+        let result =
+            tauri::async_runtime::block_on(fixture.manager.remove_selected(CATALOG_ID, selected))
+                .unwrap();
+        let registrations = registration::inventory(Path::new(&fixture.profiles[0].path)).unwrap();
+        assert_eq!(registrations.len(), 1);
+        assert_eq!(registrations[0].chrome_extension_id, OTHER);
+        assert_eq!(hash_directory(&fixture.unrelated).unwrap(), unrelated);
+        assert!(fixture.active.join("manifest.json").exists());
+        assert!(matches!(
+            result.snapshot.extensions[0].status,
+            ExtensionStatus::NotInstalled
+        ));
+        assert_eq!(fixture.mutations.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn switching_profile_changes_detection_and_rejects_a_previous_profiles_target() {
+        let mut fixture = fixture(None);
+        let selected = target(&fixture);
+        let snapshot = fixture.manager.select_profile("Profile 1").unwrap();
+        assert_eq!(snapshot.selected_profile, "Profile 1");
+        assert!(matches!(
+            snapshot.extensions[0].status,
+            ExtensionStatus::NotInstalled
+        ));
+        let error =
+            tauri::async_runtime::block_on(fixture.manager.remove_selected(CATALOG_ID, selected))
+                .unwrap_err();
+        assert!(error.contains("profile changed"));
+        assert_eq!(fixture.mutations.load(AtomicOrdering::SeqCst), 0);
+        assert!(matches!(
+            fixture
+                .manager
+                .select_profile("Default")
+                .unwrap()
+                .extensions[0]
+                .status,
+            ExtensionStatus::UpdateReady
+        ));
+    }
+
+    #[test]
+    fn unreadable_registrations_are_a_detection_failure_not_an_empty_installation_list() {
+        let fixture = fixture(None);
+        fs::write(
+            Path::new(&fixture.profiles[0].path).join("Secure Preferences"),
+            "invalid JSON",
+        )
+        .unwrap();
+        let snapshot = fixture.manager.snapshot().unwrap();
+        assert!(snapshot.detection_error.is_some());
+        assert!(matches!(
+            snapshot.extensions[0].status,
+            ExtensionStatus::DetectionUnavailable
+        ));
+        assert!(fixture
+            .manager
+            .prepare_installation(CATALOG_ID, None)
+            .is_err());
+    }
+
+    #[test]
+    fn duplicate_manifest_names_require_an_explicit_installation_selection() {
+        let fixture = fixture(None);
+        write_extension(&fixture.unrelated, "Sample Extension", "1.0.0");
+        let snapshot = fixture.manager.snapshot().unwrap();
+        assert!(matches!(
+            snapshot.extensions[0].status,
+            ExtensionStatus::Ambiguous
+        ));
+        assert_eq!(snapshot.extensions[0].installations.len(), 2);
+        assert!(fixture
+            .manager
+            .prepare_installation(CATALOG_ID, None)
+            .is_err());
+        let consent = fixture
+            .manager
+            .prepare_installation(CATALOG_ID, Some(&target(&fixture)))
             .unwrap()
-            .extensions
-            .is_empty());
+            .unwrap();
+        assert!(registration::same_path(
+            Path::new(&consent.path),
+            &fixture.active
+        ));
     }
 
     #[test]
-    fn updating_a_stale_id_preserves_active_and_pending_files() {
-        let (_temp, mut manager, mutations) = manager_fixture();
-        register_wrong_id(&manager);
-        let pending = manager.paths.pending_dir("PurgeUndesirables", "1.1.0");
-        fs::create_dir_all(&pending).unwrap();
-        fs::write(pending.join("content.js"), "pending").unwrap();
-        let mut state = manager.paths.load_repository_state().unwrap();
-        let extension = state.extensions.get_mut("PurgeUndesirables").unwrap();
-        extension.pending_version = Some("1.1.0".into());
-        extension.pending_hashes = hash_directory(&pending).unwrap();
-        manager.paths.save_repository_state(&state).unwrap();
-        assert!(tauri::async_runtime::block_on(manager.update("PurgeUndesirables")).is_err());
-        assert_eq!(mutations.load(Ordering::SeqCst), 0);
+    fn manifest_names_match_exactly_without_legacy_aliases() {
+        let fixture = fixture(None);
+        write_extension(&fixture.active, "Different Name", "1.0.0");
+        let snapshot = fixture.manager.snapshot().unwrap();
+        assert!(matches!(
+            snapshot.extensions[0].status,
+            ExtensionStatus::NotInstalled
+        ));
+        assert!(snapshot.extensions[0].installations.is_empty());
+    }
+
+    #[test]
+    fn equal_or_older_remote_versions_are_installed_without_a_downgrade_action() {
+        let fixture = fixture(None);
+        for version in ["1.0.0.0", "0.9"] {
+            let mut state = fixture.manager.paths.load_repository_state().unwrap();
+            state.extensions.get_mut(CATALOG_ID).unwrap().remote_version = version.into();
+            fixture.manager.paths.save_repository_state(&state).unwrap();
+            assert!(matches!(
+                fixture.manager.snapshot().unwrap().extensions[0].status,
+                ExtensionStatus::Installed
+            ));
+        }
+        assert_eq!(fixture.mutations.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[test]
+    fn updates_without_a_trusted_baseline_require_consent_before_touching_files() {
+        let mut fixture = fixture(None);
+        stage_update(&fixture);
+        let selected = target(&fixture);
+        let before = hash_directory(&fixture.active).unwrap();
+        let error =
+            tauri::async_runtime::block_on(fixture.manager.apply(CATALOG_ID, Some(selected), None))
+                .unwrap_err();
+        assert!(error.contains("Confirm replacement"));
+        assert_eq!(hash_directory(&fixture.active).unwrap(), before);
+        assert_eq!(fixture.mutations.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[test]
+    fn approved_update_preserves_id_and_unrelated_files_and_keeps_a_backup() {
+        let mut fixture = fixture(None);
+        stage_update(&fixture);
+        let selected = target(&fixture);
+        let consent = fixture
+            .manager
+            .prepare_installation(CATALOG_ID, Some(&selected))
+            .unwrap();
+        let before = hash_directory(&fixture.active).unwrap();
+        let unrelated = hash_directory(&fixture.unrelated).unwrap();
+        let result = tauri::async_runtime::block_on(fixture.manager.apply(
+            CATALOG_ID,
+            Some(selected),
+            consent,
+        ))
+        .unwrap();
+        assert!(matches!(
+            result.snapshot.extensions[0].status,
+            ExtensionStatus::Installed
+        ));
         assert_eq!(
-            fs::read_to_string(
-                manager
-                    .paths
-                    .extension_dir("PurgeUndesirables")
-                    .join("content.js")
-            )
-            .unwrap(),
-            "active"
+            result.snapshot.extensions[0].installed_version.as_deref(),
+            Some("1.1.0")
         );
         assert_eq!(
-            fs::read_to_string(pending.join("content.js")).unwrap(),
-            "pending"
+            result.snapshot.extensions[0].installations[0].chrome_extension_id,
+            OWNED
         );
+        assert_eq!(hash_directory(&fixture.unrelated).unwrap(), unrelated);
+        let backups: Vec<_> = fs::read_dir(fixture.active.parent().unwrap())
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".nox-backup-")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(hash_directory(&backups[0].path()).unwrap(), before);
+        assert_eq!(fixture.mutations.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn changed_files_invalidate_consent_and_tampered_downloads_never_reach_chrome() {
+        let mut fixture = fixture(None);
+        stage_update(&fixture);
+        let selected = target(&fixture);
+        let consent = fixture
+            .manager
+            .prepare_installation(CATALOG_ID, Some(&selected))
+            .unwrap();
+        fs::write(fixture.active.join("content.js"), "new manual edits").unwrap();
+        let error = tauri::async_runtime::block_on(fixture.manager.apply(
+            CATALOG_ID,
+            Some(selected.clone()),
+            consent,
+        ))
+        .unwrap_err();
+        assert!(error.contains("Confirm replacement"));
+        let consent = fixture
+            .manager
+            .prepare_installation(CATALOG_ID, Some(&selected))
+            .unwrap();
+        fs::write(
+            fixture
+                .manager
+                .paths
+                .pending_dir(CATALOG_ID, "1.1.0")
+                .join("content.js"),
+            "tampered download",
+        )
+        .unwrap();
+        let error = tauri::async_runtime::block_on(fixture.manager.apply(
+            CATALOG_ID,
+            Some(selected),
+            consent,
+        ))
+        .unwrap_err();
+        assert!(error.contains("Downloaded files"));
+        assert_eq!(
+            fs::read_to_string(fixture.active.join("content.js")).unwrap(),
+            "new manual edits"
+        );
+        assert_eq!(fixture.mutations.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[test]
+    fn rejected_update_restores_the_previous_files_and_reloads_the_previous_version() {
+        let mut fixture = fixture(Some("1.1.0"));
+        stage_update(&fixture);
+        let selected = target(&fixture);
+        let consent = fixture
+            .manager
+            .prepare_installation(CATALOG_ID, Some(&selected))
+            .unwrap();
+        let before = hash_directory(&fixture.active).unwrap();
+        let error = tauri::async_runtime::block_on(fixture.manager.apply(
+            CATALOG_ID,
+            Some(selected),
+            consent,
+        ))
+        .unwrap_err();
+        assert!(error.contains("previous files were restored"));
+        assert_eq!(hash_directory(&fixture.active).unwrap(), before);
+        assert_eq!(fixture.mutations.load(AtomicOrdering::SeqCst), 2);
     }
 }
