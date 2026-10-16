@@ -21,7 +21,9 @@ use super::{registration, BrowserAutomationBackend};
 const LOAD_UNPACKED_ID: &str = "loadUnpacked";
 const FOLDER_PICKER_ADDRESS_BAR_ID: &str = "41477";
 const FOLDER_PICKER_CONFIRM_ID: &str = "1";
-const REMOVE_BUTTON_ID: &str = "removeButton";
+const DETAILS_REMOVE_ID: &str = "remove-extension";
+const DETAILS_REMOVE_NAMES: &[&str] =
+    &["Remove extension", "Remover extensão", "Remover a extensão"];
 const REMOVE_NAMES: &[&str] = &["Remove", "Remover"];
 
 pub struct WindowsChromeAutomation {
@@ -47,7 +49,7 @@ impl WindowsChromeAutomation {
             .ok_or_else(|| "Google Chrome Stable was not found in a standard location".into())
     }
 
-    fn open_extensions_page(&self) -> Result<(UIAutomation, UIElement), String> {
+    fn open_extensions_page(&self, url: &str) -> Result<(UIAutomation, UIElement), String> {
         let chrome = Self::chrome_path()?;
         let automation = UIAutomation::new()
             .map_err(|error| format!("Could not initialize Windows UI Automation: {error}"))?;
@@ -102,7 +104,7 @@ impl WindowsChromeAutomation {
         let keyboard = Keyboard::new().interval(0);
         keyboard
             .send_keys("{ctrl}(l)")
-            .and_then(|_| keyboard.send_text("chrome://extensions/"))
+            .and_then(|_| keyboard.send_text(url))
             .and_then(|_| keyboard.send_keys("{enter}"))
             .map_err(|error| {
                 format!("Could not navigate Chrome to chrome://extensions: {error}")
@@ -129,7 +131,15 @@ impl WindowsChromeAutomation {
         &self,
         action: impl FnOnce(&UIAutomation, &UIElement) -> Result<T, String>,
     ) -> Result<T, String> {
-        let (automation, window) = self.open_extensions_page()?;
+        self.with_extensions_url("chrome://extensions/", action)
+    }
+
+    fn with_extensions_url<T>(
+        &self,
+        url: &str,
+        action: impl FnOnce(&UIAutomation, &UIElement) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let (automation, window) = self.open_extensions_page(url)?;
         let result = action(&automation, &window);
         if let Ok(pattern) = window.get_pattern::<UIWindowPattern>() {
             let _ = pattern.close();
@@ -305,123 +315,106 @@ impl WindowsChromeAutomation {
         })
     }
 
-    fn find_extension_card(
+    fn verified_extension_details(
         automation: &UIAutomation,
         window: &UIElement,
         chrome_extension_id: &str,
+        extension_name: &str,
     ) -> Result<UIElement, String> {
-        // Prefer Chromium's exact extensions-item host. A flattened accessibility
-        // tree is usable only if a bounded ancestor contains exactly this ID
-        // and exactly one Remove control. Never choose controls by distance.
-        let expected_id = chrome_extension_id.to_string();
-        let cards = automation
+        // Chromium flattens extensions-item hosts out of its accessibility tree.
+        // Use the dedicated details page instead of inferring card boundaries
+        // from neighboring ID labels and Remove buttons in the full list.
+        let documents = automation
             .create_matcher()
             .from(window.clone())
-            .filter_fn(Box::new(move |element: &UIElement| {
-                Ok(element.get_automation_id()? == expected_id)
-            }))
-            .depth(30)
-            .timeout(0)
-            .find_all()
-            .unwrap_or_default();
-        if !cards.is_empty() {
-            return exactly_one(cards, "extension card");
-        }
-
-        let expected = chrome_extension_id.to_string();
-        let labels = automation
-            .create_matcher()
-            .from(window.clone())
-            .filter_fn(Box::new(move |element: &UIElement| {
-                Ok(element
-                    .get_name()
-                    .ok()
-                    .and_then(|name| extract_chrome_extension_id(&name))
-                    .as_deref()
-                    == Some(&expected))
+            .control_type(ControlType::Document)
+            .filter_fn(Box::new(|element: &UIElement| {
+                Ok(element.get_automation_id()? == "RootWebArea")
             }))
             .depth(30)
             .timeout(5_000)
             .find_all()
-            .map_err(|_| {
-                format!("Chrome did not expose ID {chrome_extension_id}; action blocked")
+            .map_err(|error| {
+                format!("Could not read Chrome's extension details document: {error}")
             })?;
-        let mut current = exactly_one(labels, "extension ID label")?;
-        let walker = automation
-            .get_control_view_walker()
-            .map_err(|error| error.to_string())?;
-        for _ in 0..10 {
-            let labels = automation
-                .create_matcher()
-                .from(current.clone())
-                .filter_fn(Box::new(|element: &UIElement| {
-                    Ok(element
-                        .get_name()
-                        .ok()
-                        .and_then(|name| extract_chrome_extension_id(&name))
-                        .is_some())
-                }))
-                .depth(30)
-                .timeout(0)
-                .find_all()
-                .map_err(|error| error.to_string())?;
-            let ids: BTreeSet<_> = labels
-                .into_iter()
-                .filter_map(|element| {
-                    element
-                        .get_name()
-                        .ok()
-                        .and_then(|name| extract_chrome_extension_id(&name))
-                })
-                .collect();
-            let remove_count = automation
-                .create_matcher()
-                .from(current.clone())
-                .control_type(ControlType::Button)
-                .filter_fn(Box::new(|element: &UIElement| {
-                    Ok(element.get_automation_id()? == REMOVE_BUTTON_ID)
-                }))
-                .depth(30)
-                .timeout(0)
-                .find_all()
-                .ok()
-                .map(|buttons| buttons.len())
-                .unwrap_or(0);
-            if card_scope_is_unique(chrome_extension_id, &ids, remove_count) {
-                return Ok(current);
-            }
-            if ids.len() > 1 || remove_count > 1 {
-                break;
-            }
-            current = walker
-                .get_parent(&current)
-                .map_err(|error| error.to_string())?;
+        let document = exactly_one(documents, "extension details document")?;
+        let addresses = automation
+            .create_matcher()
+            .from(window.clone())
+            .control_type(ControlType::Edit)
+            .filter_fn(Box::new(|element: &UIElement| {
+                Ok(element.get_automation_id()? == "view_1012")
+            }))
+            .depth(30)
+            .timeout(0)
+            .find_all()
+            .map_err(|error| format!("Could not verify Chrome's details URL: {error}"))?;
+        let address = exactly_one(addresses, "Chrome address bar")?;
+        let url = address
+            .get_pattern::<UIValuePattern>()
+            .and_then(|pattern| pattern.get_value())
+            .map_err(|error| format!("Could not read Chrome's details URL: {error}"))?;
+        let headings = automation
+            .create_matcher()
+            .from(document.clone())
+            .filter_fn(Box::new(|element: &UIElement| {
+                Ok(element.get_automation_id()? == "name")
+            }))
+            .depth(30)
+            .timeout(5_000)
+            .find_all()
+            .map_err(|error| format!("Could not read the extension's details heading: {error}"))?;
+        let names = headings
+            .iter()
+            .map(|element| element.get_name().map_err(|error| error.to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let labels = automation
+            .create_matcher()
+            .from(document.clone())
+            .control_type(ControlType::Text)
+            .depth(30)
+            .timeout(0)
+            .find_all()
+            .map_err(|error| format!("Could not read the extension's visible ID: {error}"))?;
+        let mut ids = BTreeSet::new();
+        for label in labels {
+            let name = label
+                .get_name()
+                .map_err(|error| format!("Could not read details text: {error}"))?;
+            ids.extend(extract_chrome_extension_ids(&name));
         }
-        Err(format!(
-            "Chrome did not expose an isolated card for {chrome_extension_id}; action blocked"
-        ))
+        if !details_identity_matches(&url, chrome_extension_id, extension_name, &ids, &names) {
+            return Err(format!("Extension details identity did not match {chrome_extension_id} ({extension_name}); URL={url}, IDs={ids:?}, names={names:?}; removal blocked"));
+        }
+        Ok(document)
     }
 
-    fn find_extension_button(
+    fn find_details_remove(
         automation: &UIAutomation,
-        window: &UIElement,
-        chrome_extension_id: &str,
-        automation_ids: &'static [&'static str],
-        label: &str,
+        document: &UIElement,
     ) -> Result<UIElement, String> {
-        let card = Self::find_extension_card(automation, window, chrome_extension_id)?;
         let buttons = automation
             .create_matcher()
-            .from(card)
-            .control_type(ControlType::Button)
-            .filter_fn(Box::new(move |element: &UIElement| {
-                Ok(automation_ids.contains(&element.get_automation_id()?.as_str()))
+            .from(document.clone())
+            .filter_fn(Box::new(|element: &UIElement| {
+                Ok(is_details_remove_control(
+                    element.get_control_type()?,
+                    &element.get_automation_id()?,
+                    &element.get_name()?,
+                ))
             }))
-            .depth(12)
+            .depth(30)
             .timeout(3_000)
             .find_all()
-            .map_err(|_| format!("{label} was not found for {chrome_extension_id}"))?;
-        exactly_one(buttons, label)
+            .map_err(|error| {
+                format!(
+                    "Chrome did not expose Remove extension in the verified details page: {error}"
+                )
+            })?;
+        exactly_one(
+            buttons,
+            "Remove extension control in the verified details page",
+        )
     }
 
     fn profile_directory(&self) -> Result<PathBuf, String> {
@@ -494,31 +487,35 @@ impl BrowserAutomationBackend for WindowsChromeAutomation {
         if manifest.name.trim().is_empty() {
             return Err("The extension name is empty; removal blocked".into());
         }
-        self.with_extensions_page(|automation, window| {
+        let url = extension_details_url(chrome_extension_id)?;
+        let result = self.with_extensions_url(&url, |automation, window| {
             self.verify_identity(extension_path, chrome_extension_id)?;
-            let remove = Self::find_extension_button(
+            let document = Self::verified_extension_details(
                 automation,
                 window,
                 chrome_extension_id,
-                &[REMOVE_BUTTON_ID],
-                "Remove",
-            )
-            .map_err(|_| format!("Remove was not found for {chrome_extension_id}"))?;
+                &manifest.name,
+            )?;
+            let remove = Self::find_details_remove(automation, &document)?;
+            self.verify_identity(extension_path, chrome_extension_id)?;
+            // Re-read the page immediately before invoking its destructive
+            // action; stale navigation must never select another installation.
+            Self::verified_extension_details(automation, window, chrome_extension_id, &manifest.name)?;
             invoke(&remove, "Remove")?;
             let extension_name = manifest.name.clone();
             let dialogs = automation
                 .create_matcher()
                 .from(window.clone())
-                .control_type(ControlType::Window)
                 .filter_fn(Box::new(move |element: &UIElement| {
-                    Ok(element.get_name()?.contains(&extension_name))
+                    Ok((element.is_dialog().unwrap_or(false)
+                        || element.get_control_type()? == ControlType::Window)
+                        && element.get_name()?.contains(&extension_name))
                 }))
                 .depth(12)
                 .timeout(5_000)
                 .find_all()
-                .map_err(|_| {
-                    "Chrome did not expose a removal dialog naming this extension; removal blocked"
-                        .to_string()
+                .map_err(|error| {
+                    format!("Chrome did not expose a removal dialog naming this extension; removal blocked: {error}")
                 })?;
             let dialog = exactly_one(dialogs, "removal dialog naming this extension")?;
             let buttons = automation
@@ -531,8 +528,8 @@ impl BrowserAutomationBackend for WindowsChromeAutomation {
                 .depth(8)
                 .timeout(3_000)
                 .find_all()
-                .map_err(|_| {
-                    "Chrome's removal confirmation was not found in the target dialog".to_string()
+                .map_err(|error| {
+                    format!("Chrome's removal confirmation was not found in the target dialog: {error}")
                 })?;
             let confirm = exactly_one(buttons, "removal confirmation")?;
             self.verify_identity(extension_path, chrome_extension_id)?;
@@ -546,7 +543,19 @@ impl BrowserAutomationBackend for WindowsChromeAutomation {
                 thread::sleep(Duration::from_millis(100));
             }
             Ok(())
-        })
+        });
+        if let Err(error) = &result {
+            if let Ok(paths) = crate::storage::StoragePaths::discover() {
+                paths.log(&format!(
+                    "Chrome Remove: profile={}, path={}, ID={chrome_extension_id}; {error}",
+                    self.profile_directory()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|_| "<unavailable>".into()),
+                    extension_path.display()
+                ));
+            }
+        }
+        result
     }
 }
 
@@ -877,15 +886,52 @@ fn exactly_one<T>(mut candidates: Vec<T>, label: &str) -> Result<T, String> {
     Ok(candidates.remove(0))
 }
 
-fn card_scope_is_unique(expected: &str, ids: &BTreeSet<String>, remove_count: usize) -> bool {
-    ids.len() == 1 && ids.contains(expected) && remove_count == 1
+fn extension_details_url(id: &str) -> Result<String, String> {
+    if id.len() != 32 || !id.bytes().all(|byte| (b'a'..=b'p').contains(&byte)) {
+        return Err("Invalid Chrome extension ID; removal blocked".into());
+    }
+    Ok(format!("chrome://extensions/?id={id}"))
 }
 
-fn extract_chrome_extension_id(value: &str) -> Option<String> {
+fn details_identity_matches(
+    url: &str,
+    expected_id: &str,
+    expected_name: &str,
+    ids: &BTreeSet<String>,
+    names: &[String],
+) -> bool {
+    let Ok(url) = url::Url::parse(url) else {
+        return false;
+    };
+    url.scheme() == "chrome"
+        && url.host_str() == Some("extensions")
+        && matches!(url.path(), "" | "/")
+        && url.fragment().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port().is_none()
+        && url.query_pairs().count() == 1
+        && url
+            .query_pairs()
+            .next()
+            .is_some_and(|(key, value)| key == "id" && value == expected_id)
+        && ids.len() == 1
+        && ids.contains(expected_id)
+        && names.len() == 1
+        && names[0].trim() == expected_name.trim()
+}
+
+fn is_details_remove_control(control_type: ControlType, id: &str, name: &str) -> bool {
+    matches!(control_type, ControlType::Button | ControlType::Hyperlink)
+        && (id == DETAILS_REMOVE_ID || name_matches(name, DETAILS_REMOVE_NAMES))
+}
+
+fn extract_chrome_extension_ids(value: &str) -> BTreeSet<String> {
     value
         .split(|character| !('a'..='p').contains(&character))
-        .find(|candidate| candidate.len() == 32)
+        .filter(|candidate| candidate.len() == 32)
         .map(str::to_owned)
+        .collect()
 }
 
 fn invoke(element: &UIElement, label: &str) -> Result<(), String> {
@@ -992,29 +1038,101 @@ mod tests {
     }
 
     #[test]
-    fn shared_ancestors_and_neighboring_controls_are_never_extension_cards() {
+    fn remove_requires_the_exact_details_route_and_visible_identity() {
         let expected = "abcdefghijklmnopabcdefghijklmnop";
         let other = "ponmlkjihgfedcbaponmlkjihgfedcba";
-        assert!(card_scope_is_unique(
+        let url = extension_details_url(expected).unwrap();
+        let ids = BTreeSet::from([expected.into()]);
+        let names = vec!["Example extension".into()];
+        assert!(details_identity_matches(
+            &url,
             expected,
-            &BTreeSet::from([expected.into()]),
-            1
+            "Example extension",
+            &ids,
+            &names
         ));
-        assert!(!card_scope_is_unique(
-            expected,
-            &BTreeSet::from([expected.into(), other.into()]),
-            1
+        for wrong_url in [
+            "chrome://extensions/".into(),
+            extension_details_url(other).unwrap(),
+            format!("https://extensions/?id={expected}"),
+            format!("chrome://extensions/?id={expected}&id={other}"),
+            format!("chrome://extensions/?id={expected}#other"),
+        ] {
+            assert!(!details_identity_matches(
+                &wrong_url,
+                expected,
+                "Example extension",
+                &ids,
+                &names
+            ));
+        }
+        for wrong_ids in [
+            BTreeSet::new(),
+            BTreeSet::from([other.into()]),
+            BTreeSet::from([expected.into(), other.into()]),
+        ] {
+            assert!(!details_identity_matches(
+                &url,
+                expected,
+                "Example extension",
+                &wrong_ids,
+                &names
+            ));
+        }
+        for wrong_names in [
+            vec![],
+            vec!["Another extension".into()],
+            vec!["Example extension".into(), "Example extension".into()],
+        ] {
+            assert!(!details_identity_matches(
+                &url,
+                expected,
+                "Example extension",
+                &ids,
+                &wrong_names
+            ));
+        }
+    }
+
+    #[test]
+    fn details_remove_accepts_the_link_and_never_a_list_or_settings_button() {
+        assert!(is_details_remove_control(
+            ControlType::Hyperlink,
+            "icon",
+            "Remove extension"
         ));
-        assert!(!card_scope_is_unique(
-            expected,
-            &BTreeSet::from([expected.into()]),
-            2
+        assert!(is_details_remove_control(
+            ControlType::Button,
+            DETAILS_REMOVE_ID,
+            "Localized label"
         ));
-        assert!(!card_scope_is_unique(
-            expected,
-            &BTreeSet::from([other.into()]),
-            1
+        assert!(!is_details_remove_control(
+            ControlType::Button,
+            "removeButton",
+            "Remove"
         ));
-        assert!(!card_scope_is_unique(expected, &BTreeSet::new(), 1));
+        assert!(!is_details_remove_control(
+            ControlType::Hyperlink,
+            "icon",
+            "Site settings"
+        ));
+        assert!(!is_details_remove_control(
+            ControlType::Text,
+            DETAILS_REMOVE_ID,
+            "Remove extension"
+        ));
+    }
+
+    #[test]
+    fn details_url_rejects_invalid_ids_and_id_extraction_keeps_all_candidates() {
+        for invalid in ["", "abc", "../../other", "abcdefghijklmnopabcdefghijklmnoq"] {
+            assert!(extension_details_url(invalid).is_err());
+        }
+        let expected = "abcdefghijklmnopabcdefghijklmnop";
+        let other = "ponmlkjihgfedcbaponmlkjihgfedcba";
+        assert_eq!(
+            extract_chrome_extension_ids(&format!("ID: {expected}, ID: {other}")),
+            BTreeSet::from([expected.into(), other.into()])
+        );
     }
 }
