@@ -1,11 +1,15 @@
 {
   "manifest_version": 3,
   "name": "PurgeUndesirables",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Selectively removes chosen domains from Chrome history and keeps future visits out of history.",
   "permissions": [
     "history",
-    "storage"
+    "storage",
+    "permissions"
+  ],
+  "optional_host_permissions": [
+    "<all_urls>"
   ],
   "background": {
     "service_worker": "background.js",

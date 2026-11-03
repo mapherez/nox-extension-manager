@@ -54,6 +54,57 @@
         <div id="domain-list" class="domain-list"></div>
       </section>
 
+      <section class="card sync-section" aria-labelledby="sync-title">
+        <div class="section-heading">
+          <h2 id="sync-title">Sync (NoX Backend)</h2>
+          <span id="sync-revision" class="count" title="Last backend revision known to this device">—</span>
+        </div>
+
+        <div class="sync-settings">
+          <label class="field-label" for="backend-url">Backend URL</label>
+          <input
+            id="backend-url"
+            type="text"
+            placeholder="https://backend.example.com"
+            autocomplete="off"
+            spellcheck="false"
+          />
+
+          <label class="field-label" for="backend-api-key">API key</label>
+          <input
+            id="backend-api-key"
+            type="password"
+            placeholder="noxsync_…"
+            autocomplete="off"
+            spellcheck="false"
+          />
+
+          <label class="field-label" for="client-name">Device name</label>
+          <input
+            id="client-name"
+            type="text"
+            placeholder="Work laptop"
+            autocomplete="off"
+            spellcheck="false"
+          />
+
+          <div class="sync-actions">
+            <button id="save-settings" class="secondary" type="button">Save settings</button>
+            <button id="test-connection" class="secondary" type="button">Test</button>
+          </div>
+        </div>
+
+        <div class="sync-actions">
+          <button id="save-data" class="primary" type="button">Save data</button>
+          <button id="load-data" class="secondary" type="button">Load data</button>
+        </div>
+
+        <p class="sync-hint">
+          Save pushes this device's domain list to the backend vault "purge-undesirables".
+          Load replaces this device's list with the backend copy. Nothing syncs until you press a button.
+        </p>
+      </section>
+
       <p id="status" class="status" role="status" aria-live="polite"></p>
 
       <footer class="footer">

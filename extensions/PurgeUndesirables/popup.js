@@ -5,6 +5,13 @@ import {
   saveBlockedDomains,
   upsertBlockedDomain
 } from "./storage.js";
+import {
+  getBackendSettings,
+  saveBackendSettings,
+  getLastKnownRevision,
+  setLastKnownRevision
+} from "./settings.js";
+import { loadState, saveState, testConnection, friendlyError } from "./backend.js";
 
 const form = document.querySelector("#add-form");
 const domainInput = document.querySelector("#domain-input");
@@ -15,6 +22,15 @@ const emptyState = document.querySelector("#empty-state");
 const domainCount = document.querySelector("#domain-count");
 const status = document.querySelector("#status");
 const submitButton = form.querySelector("button[type='submit']");
+
+const backendUrlInput = document.querySelector("#backend-url");
+const backendApiKeyInput = document.querySelector("#backend-api-key");
+const clientNameInput = document.querySelector("#client-name");
+const saveSettingsButton = document.querySelector("#save-settings");
+const testConnectionButton = document.querySelector("#test-connection");
+const saveDataButton = document.querySelector("#save-data");
+const loadDataButton = document.querySelector("#load-data");
+const syncRevision = document.querySelector("#sync-revision");
 
 function setStatus(message = "", isError = false) {
   status.textContent = message;
@@ -166,5 +182,137 @@ form.addEventListener("submit", async (event) => {
   }
 });
 
+// --- NoX Backend sync ---
+
+function readSettingsFromForm() {
+  return {
+    serverUrl: backendUrlInput.value.trim(),
+    apiKey: backendApiKeyInput.value.trim(),
+    clientName: clientNameInput.value.trim()
+  };
+}
+
+function requireSavedSettings(settings) {
+  if (!settings.serverUrl || !settings.apiKey) {
+    throw new Error("Set the backend URL and API key, then press Save settings.");
+  }
+  return settings;
+}
+
+async function renderSettings() {
+  const settings = await getBackendSettings();
+  backendUrlInput.value = settings.serverUrl || "";
+  backendApiKeyInput.value = settings.apiKey || "";
+  clientNameInput.value = settings.clientName || "";
+}
+
+async function renderSyncRevision() {
+  const revision = await getLastKnownRevision();
+  syncRevision.textContent = revision > 0 ? String(revision) : "—";
+}
+
+saveSettingsButton.addEventListener("click", async () => {
+  try {
+    await saveBackendSettings(readSettingsFromForm());
+    setStatus("Backend settings saved on this device.");
+  } catch (error) {
+    setStatus(error.message, true);
+  }
+});
+
+testConnectionButton.addEventListener("click", async () => {
+  const settings = readSettingsFromForm();
+  if (!settings.serverUrl || !settings.apiKey) {
+    return setStatus("Enter the backend URL and API key first.", true);
+  }
+
+  setStatus("Testing connection…");
+  try {
+    const identity = await testConnection(settings);
+    setStatus(`Connected as ${identity.user}.`);
+  } catch (error) {
+    setStatus(friendlyError(error), true);
+  }
+});
+
+saveDataButton.addEventListener("click", async () => {
+  let saved;
+  try {
+    saved = requireSavedSettings(await getBackendSettings());
+  } catch (error) {
+    return setStatus(error.message, true);
+  }
+
+  saveDataButton.disabled = true;
+  setStatus("Saving to backend…");
+
+  try {
+    const entries = await getBlockedDomains();
+    const result = await saveState(saved, await getLastKnownRevision(), {
+      app: "purge-undesirables",
+      version: 1,
+      savedAt: new Date().toISOString(),
+      entries
+    });
+
+    if (result.action === "uploaded") {
+      await setLastKnownRevision(result.serverRevision);
+      syncRevision.textContent = String(result.serverRevision);
+      setStatus(`Saved ${entries.length} domain(s) to the backend (revision ${result.serverRevision}).`);
+    } else if (result.action === "already-up-to-date") {
+      setStatus("The backend copy is already up to date.");
+    } else {
+      setStatus(
+        "The backend copy differs from this device's copy. Press Load data to replace the local list with the backend copy.",
+        true
+      );
+    }
+  } catch (error) {
+    setStatus(friendlyError(error), true);
+  } finally {
+    saveDataButton.disabled = false;
+  }
+});
+
+loadDataButton.addEventListener("click", async () => {
+  let saved;
+  try {
+    saved = requireSavedSettings(await getBackendSettings());
+  } catch (error) {
+    return setStatus(error.message, true);
+  }
+
+  loadDataButton.disabled = true;
+  setStatus("Loading from backend…");
+
+  try {
+    const remote = await loadState(saved);
+    const entries = remote.entries
+      .filter((entry) => entry && typeof entry.domain === "string")
+      .map((entry) => ({ domain: entry.domain, purgeFuture: entry.purgeFuture !== false }));
+
+    const local = await getBlockedDomains();
+    if (
+      local.length > 0 &&
+      !confirm(`Replace the ${local.length} local domain(s) with the backend copy (${entries.length})?`)
+    ) {
+      setStatus("Load cancelled.");
+      return;
+    }
+
+    await saveBlockedDomains(entries);
+    await setLastKnownRevision(remote.serverRevision);
+    syncRevision.textContent = String(remote.serverRevision);
+    await renderDomains();
+    setStatus(`Loaded ${entries.length} domain(s) from the backend.`);
+  } catch (error) {
+    setStatus(friendlyError(error), true);
+  } finally {
+    loadDataButton.disabled = false;
+  }
+});
+
+await renderSettings();
+await renderSyncRevision();
 await renderDomains();
 domainInput.focus();
