@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "Twitch Tooltip Fix",
+  "version": "1.0.0",
+  "description": "Hides Twitch sidebar channel previews immediately after hovering ends.",
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.twitch.tv/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_start"
+    }
+  ]
+}
