@@ -45,6 +45,39 @@ You can later disable auto-purge for a domain, manually run **Purge now**, or re
 
 Removing a domain from the list does not restore history that was already deleted.
 
+## Syncing between computers (NoX Backend)
+
+PurgeUndesirables can push and pull its domain list through a self-hosted
+[NoX Backend](https://github.com/mapherez/nox-backend) instance, so the same
+list can be used on multiple computers. Sync is fully manual:
+
+- **Save data** pushes this device's domain list to the backend vault
+  `purge-undesirables` (stored as `state.json`).
+- **Load data** replaces this device's domain list with the backend copy
+  (asks for confirmation first when the local list is not empty).
+
+### Setup
+
+1. Have a running NoX Backend instance and an API key from its dashboard.
+2. In the extension popup, fill in **Backend URL** (base URL, e.g.
+   `https://backend.example.com`), **API key** and a **Device name**.
+3. Click **Save settings**, then **Test** (shows the authenticated user).
+4. On first use Chrome asks for permission to reach the backend origin;
+   approve it once per machine.
+5. Click **Save data** on one computer (creates the vault on first run),
+   then **Load data** on the others.
+
+### Behavior
+
+- `Save data` uses the backend's sync protocol and only uploads when this
+  device's copy is the newest. If the backend copy is newer — or both sides
+  changed — it tells you to press `Load data`.
+- The backend URL, API key, device ID and last-seen backend revision are
+  stored per machine in `chrome.storage.local`. The API key is only ever sent
+  to the configured backend.
+- Nothing syncs in the background; data leaves this machine only when you
+  press a button.
+
 ## Notes
 
 Chrome can source omnibox suggestions from places other than browsing history, including bookmarks and search suggestions. This extension specifically targets history-backed suggestions.

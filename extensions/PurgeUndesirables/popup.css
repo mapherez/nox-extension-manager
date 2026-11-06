@@ -301,3 +301,50 @@ input[type="text"]:focus {
   font-size: 10px;
   line-height: 1.45;
 }
+
+.sync-section {
+  margin-top: 18px;
+  padding: 14px;
+}
+
+.sync-section .section-heading {
+  margin-bottom: 12px;
+}
+
+.sync-settings {
+  display: grid;
+  gap: 6px;
+}
+
+.sync-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.sync-actions .primary,
+.sync-actions .secondary {
+  flex: 1;
+}
+
+.sync-hint {
+  margin: 12px 0 0;
+  color: #777b83;
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+input[type="password"] {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid #35383e;
+  border-radius: 9px;
+  outline: none;
+  background: #101114;
+  color: #f4f4f5;
+  padding: 9px 10px;
+}
+
+input[type="password"]:focus {
+  border-color: #696e77;
+}
